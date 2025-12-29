@@ -44,6 +44,8 @@ pub(crate) struct WindowsPlatform {
     invalidate_devices: Arc<AtomicBool>,
     handle: HWND,
     disable_direct_composition: bool,
+    /// Coordinator for managing window tabs on Windows
+    tab_coordinator: Rc<WindowsTabCoordinator>,
 }
 
 struct WindowsPlatformInner {
@@ -169,6 +171,7 @@ impl WindowsPlatform {
             windows_version,
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
+            tab_coordinator: Rc::new(WindowsTabCoordinator::new()),
         })
     }
 
@@ -182,12 +185,17 @@ impl WindowsPlatform {
 
     #[inline]
     fn post_message(&self, message: u32, wparam: WPARAM, lparam: LPARAM) {
-        self.raw_window_handles
-            .read()
-            .iter()
-            .for_each(|handle| unsafe {
-                PostMessageW(Some(handle.as_raw()), message, wparam, lparam).log_err();
-            });
+        let mut handles = self.raw_window_handles.write();
+        handles.retain(|handle| {
+            let hwnd = handle.as_raw();
+            !hwnd.is_invalid() && unsafe { IsWindow(Some(hwnd)).as_bool() }
+        });
+
+        for handle in handles.iter() {
+            unsafe {
+                let _ = PostMessageW(Some(handle.as_raw()), message, wparam, lparam);
+            }
+        }
     }
 
     fn generate_creation_info(&self) -> WindowCreationInfo {
@@ -203,6 +211,7 @@ impl WindowsPlatform {
             disable_direct_composition: self.disable_direct_composition,
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
+            tab_coordinator: self.tab_coordinator.clone(),
         }
     }
 
@@ -941,6 +950,8 @@ pub(crate) struct WindowCreationInfo {
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,
+    /// Coordinator for managing window tabs
+    pub(crate) tab_coordinator: Rc<WindowsTabCoordinator>,
 }
 
 struct PlatformWindowCreateContext {

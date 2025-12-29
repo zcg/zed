@@ -23,6 +23,11 @@ mod test;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// Expose the Win32 window handle type in gpui's public API on Windows so callers
+// can interact with platform-specific window grouping behavior.
+#[cfg(target_os = "windows")]
+pub use self::windows::HWND;
+
 #[cfg(all(
     feature = "screen-capture",
     any(
@@ -539,9 +544,15 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn move_tab_to_new_window(&self) {}
     fn toggle_window_tab_overview(&self) {}
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
+    fn tabbing_identifier(&self) -> Option<String> {
+        None
+    }
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::HWND;
+
+    #[cfg(target_os = "windows")]
+    fn merge_into_tabbing_group(&self, _target_identifier: String, _target_hwnd: windows::HWND) {}
 
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {

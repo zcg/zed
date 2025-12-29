@@ -17,7 +17,6 @@ use futures::{
     channel::oneshot,
     future::{LocalBoxFuture, Shared},
 };
-use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
@@ -279,11 +278,40 @@ impl SystemWindowTab {
     }
 }
 
+/// A transient drag preview for system window tabs on Windows.
+///
+/// This is used by custom window tab bars (like Zed's) to render a placeholder
+/// while the user drags a window tab over another window's tab bar.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SystemWindowTabDragPreview {
+    /// The window whose tab bar should render the placeholder.
+    pub target_window_id: WindowId,
+    /// The insertion index where the placeholder should appear.
+    pub insert_ix: usize,
+}
+
+/// Per-window metrics for rendering/positioning system window tabs on Windows.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SystemWindowTabBarMetrics {
+    /// The measured width of a single tab in this window's tab bar.
+    pub tab_width: Pixels,
+    /// The current horizontal scroll offset of the tab bar.
+    pub scroll_offset_x: Pixels,
+    /// The current number of tabs in the group.
+    pub tab_count: usize,
+}
+
 /// A controller for managing window tabs.
 #[derive(Default)]
 pub struct SystemWindowTabController {
     visible: Option<bool>,
     tab_groups: FxHashMap<usize, Vec<SystemWindowTab>>,
+    #[cfg(target_os = "windows")]
+    drag_preview: Option<SystemWindowTabDragPreview>,
+    #[cfg(target_os = "windows")]
+    tab_bar_metrics: FxHashMap<WindowId, SystemWindowTabBarMetrics>,
 }
 
 impl Global for SystemWindowTabController {}
@@ -294,6 +322,10 @@ impl SystemWindowTabController {
         Self {
             visible: None,
             tab_groups: FxHashMap::default(),
+            #[cfg(target_os = "windows")]
+            drag_preview: None,
+            #[cfg(target_os = "windows")]
+            tab_bar_metrics: FxHashMap::default(),
         }
     }
 
@@ -305,6 +337,46 @@ impl SystemWindowTabController {
     /// Get all tab groups.
     pub fn tab_groups(&self) -> &FxHashMap<usize, Vec<SystemWindowTab>> {
         &self.tab_groups
+    }
+
+    /// Get the number of tab groups.
+    pub fn tab_groups_count(&self) -> usize {
+        self.tab_groups.len()
+    }
+
+    /// Get the currently active Windows drag preview, if any.
+    #[cfg(target_os = "windows")]
+    pub fn drag_preview(&self) -> Option<SystemWindowTabDragPreview> {
+        self.drag_preview
+    }
+
+    /// Set the Windows drag preview. Returns `true` if it changed.
+    #[cfg(target_os = "windows")]
+    pub fn set_drag_preview(cx: &mut App, preview: Option<SystemWindowTabDragPreview>) -> bool {
+        let mut controller = cx.global_mut::<SystemWindowTabController>();
+        if controller.drag_preview == preview {
+            false
+        } else {
+            controller.drag_preview = preview;
+            true
+        }
+    }
+
+    /// Update the cached tab bar metrics for a window.
+    #[cfg(target_os = "windows")]
+    pub fn set_tab_bar_metrics(
+        cx: &mut App,
+        window_id: WindowId,
+        metrics: SystemWindowTabBarMetrics,
+    ) {
+        let mut controller = cx.global_mut::<SystemWindowTabController>();
+        controller.tab_bar_metrics.insert(window_id, metrics);
+    }
+
+    /// Get cached tab bar metrics for a window.
+    #[cfg(target_os = "windows")]
+    pub fn tab_bar_metrics(&self, window_id: WindowId) -> Option<&SystemWindowTabBarMetrics> {
+        self.tab_bar_metrics.get(&window_id)
     }
 
     /// Get the next tab group window handle.
@@ -440,34 +512,47 @@ impl SystemWindowTabController {
     /// Insert a tab into a tab group.
     pub fn add_tab(cx: &mut App, id: WindowId, tabs: Vec<SystemWindowTab>) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
-        let Some(tab) = tabs.iter().find(|tab| tab.id == id).cloned() else {
+        // Defensive: callers should pass a full tab snapshot (including `id`).
+        if !tabs.iter().any(|tab| tab.id == id) {
             return;
-        };
+        }
 
-        let mut expected_tab_ids: Vec<_> = tabs
-            .iter()
-            .filter(|tab| tab.id != id)
-            .map(|tab| tab.id)
-            .sorted()
-            .collect();
+        // Treat `tabs` as the source-of-truth for this tab group.
+        // This keeps the controller consistent even if `add_tab` is called multiple times for
+        // windows that are already part of the same system tab group (common on Windows).
+        let tab_ids: FxHashSet<WindowId> = tabs.iter().map(|tab| tab.id).collect();
 
-        let mut tab_group_id = None;
-        for (group_id, group_tabs) in &controller.tab_groups {
-            let tab_ids: Vec<_> = group_tabs.iter().map(|tab| tab.id).sorted().collect();
-            if tab_ids == expected_tab_ids {
-                tab_group_id = Some(*group_id);
-                break;
+        // Preserve existing `last_active_at` values for windows we already know about, so we don't
+        // accidentally reset MRU ordering just because we refreshed tab metadata.
+        let mut existing_last_active_at = FxHashMap::default();
+        for group_tabs in controller.tab_groups.values() {
+            for tab in group_tabs {
+                if tab_ids.contains(&tab.id) {
+                    existing_last_active_at
+                        .entry(tab.id)
+                        .or_insert(tab.last_active_at);
+                }
             }
         }
 
-        if let Some(tab_group_id) = tab_group_id {
-            if let Some(tabs) = controller.tab_groups.get_mut(&tab_group_id) {
-                tabs.push(tab);
+        let mut tabs = tabs;
+        for tab in &mut tabs {
+            if let Some(last_active_at) = existing_last_active_at.get(&tab.id) {
+                tab.last_active_at = *last_active_at;
             }
-        } else {
-            let new_group_id = controller.tab_groups.len();
-            controller.tab_groups.insert(new_group_id, tabs);
         }
+
+        // Drop any existing groups that overlap this tab group (stale singletons, duplicates, etc).
+        controller
+            .tab_groups
+            .retain(|_, group_tabs| !group_tabs.iter().any(|tab| tab_ids.contains(&tab.id)));
+
+        let new_group_id = controller
+            .tab_groups
+            .keys()
+            .max()
+            .map_or(0, |group_id| group_id + 1);
+        controller.tab_groups.insert(new_group_id, tabs);
     }
 
     /// Remove a tab from a tab group.
@@ -505,13 +590,32 @@ impl SystemWindowTabController {
 
         let initial_tabs_len = initial_tabs.len();
         let mut all_tabs = initial_tabs.clone();
+        let initial_tab_ids: FxHashSet<WindowId> =
+            all_tabs.iter().take(initial_tabs_len).map(|tab| tab.id).collect();
 
         for (_, mut tabs) in controller.tab_groups.drain() {
-            tabs.retain(|tab| !all_tabs[..initial_tabs_len].contains(tab));
+            // Compare by `WindowId` instead of full `SystemWindowTab` equality, since titles and
+            // `last_active_at` can differ across snapshots.
+            tabs.retain(|tab| !initial_tab_ids.contains(&tab.id));
             all_tabs.extend(tabs);
         }
 
         controller.tab_groups.insert(0, all_tabs);
+    }
+
+    /// Refresh the tab bar for all windows.
+    ///
+    /// This should be called after tab operations (move, merge) to ensure
+    /// all windows update their tab bar UI to reflect the new state.
+    /// Note: This only triggers a UI refresh; the controller state should
+    /// already be updated by the caller before invoking this.
+    pub fn refresh_all_windows(cx: &mut App) {
+        for handle in cx.windows() {
+            let _ = handle.update(cx, |_, window, _| {
+                // Trigger a window refresh to redraw the tab bar
+                window.refresh();
+            });
+        }
     }
 
     /// Selects the next tab in the tab group in the trailing direction.

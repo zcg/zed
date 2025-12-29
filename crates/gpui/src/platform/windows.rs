@@ -10,6 +10,7 @@ mod events;
 mod keyboard;
 mod platform;
 mod system_settings;
+mod tab_coordinator;
 mod util;
 mod vsync;
 mod window;
@@ -27,12 +28,13 @@ pub(crate) use events::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use system_settings::*;
+pub(crate) use tab_coordinator::*;
 pub(crate) use util::*;
 pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
-pub(crate) use windows::Win32::Foundation::HWND;
+pub use windows::Win32::Foundation::HWND;
 
 #[cfg(feature = "screen-capture")]
 pub(crate) type PlatformScreenCaptureFrame = scap::frame::Frame;

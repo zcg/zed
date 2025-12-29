@@ -68,6 +68,10 @@ pub struct WindowsWindowState {
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
+
+    // Tab management state
+    pub tabbing_identifier: Cell<Option<String>>,
+    pub tab_bar_visible: Cell<bool>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -84,6 +88,7 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: flume::Receiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    pub(crate) tab_coordinator: Rc<WindowsTabCoordinator>,
 }
 
 impl WindowsWindowState {
@@ -153,6 +158,8 @@ impl WindowsWindowState {
             initial_placement: Cell::new(initial_placement),
             hwnd,
             invalidate_devices,
+            tabbing_identifier: Cell::new(None),
+            tab_bar_visible: Cell::new(false),
         })
     }
 
@@ -243,7 +250,31 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(context.display),
             parent_hwnd: context.parent_hwnd,
+            tab_coordinator: context.tab_coordinator.clone(),
         }))
+    }
+
+    pub fn tabbing_identifier(&self) -> Option<String> {
+        let identifier = self.state.tabbing_identifier.take();
+        self.state.tabbing_identifier.set(identifier.clone());
+        identifier
+    }
+
+    fn set_tabbing_identifier(&self, identifier: Option<String>) {
+        let old_identifier = self.state.tabbing_identifier.take();
+        let hwnd = self.hwnd;
+
+        if let Some(ref old_id) = old_identifier {
+            self.tab_coordinator.unregister_window(old_id, hwnd);
+        }
+
+        if let Some(ref new_id) = identifier {
+            self.tab_coordinator.register_window(new_id, hwnd);
+        }
+
+        let is_some = identifier.is_some();
+        self.state.tabbing_identifier.set(identifier);
+        self.state.tab_bar_visible.set(is_some);
     }
 
     fn toggle_fullscreen(self: &Rc<Self>) {
@@ -350,6 +381,13 @@ pub(crate) struct Callbacks {
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
+
+    // Tab management callbacks
+    pub(crate) move_tab_to_new_window: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) merge_all_windows: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) select_next_tab: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) select_previous_tab: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) toggle_tab_bar: Cell<Option<Box<dyn FnMut()>>>,
 }
 
 struct WindowCreateContext {
@@ -371,6 +409,7 @@ struct WindowCreateContext {
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
     parent_hwnd: Option<HWND>,
+    tab_coordinator: Rc<WindowsTabCoordinator>,
 }
 
 impl WindowsWindow {
@@ -391,6 +430,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            tab_coordinator,
         } = creation_info;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -473,6 +513,7 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
             parent_hwnd,
+            tab_coordinator,
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -549,6 +590,9 @@ impl Drop for WindowsWindow {
                     RevokeDragDrop(handle).log_err();
                     DestroyWindow(handle).log_err();
                 }
+                // Clear the tabbing identifier after `DestroyWindow` so the WM_DESTROY handler
+                // can still see it and coordinate showing the next tab if needed.
+                this.set_tabbing_identifier(None);
             })
             .detach();
     }
@@ -729,10 +773,17 @@ impl PlatformWindow for WindowsWindow {
     fn activate(&self) {
         let hwnd = self.0.hwnd;
         let this = self.0.clone();
+
         self.0
             .executor
             .spawn(async move {
                 this.set_window_placement().log_err();
+
+                // Apply tab switching after initial placement so we don't immediately
+                // undo the coordinator's positioning on first activation.
+                if let Some(identifier) = this.tabbing_identifier() {
+                    this.tab_coordinator.activate_tab(&identifier, hwnd);
+                }
 
                 unsafe {
                     // If the window is minimized, restore it.
@@ -922,6 +973,143 @@ impl PlatformWindow for WindowsWindow {
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         // There is no such thing on Windows.
+    }
+
+    // Tab management methods for Windows
+    fn set_tabbing_identifier(&self, identifier: Option<String>) {
+        self.0.set_tabbing_identifier(identifier);
+    }
+
+    fn tabbing_identifier(&self) -> Option<String> {
+        self.0.tabbing_identifier()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn merge_into_tabbing_group(&self, target_identifier: String, target_hwnd: HWND) {
+        // Register this window into the target group.
+        self.0.set_tabbing_identifier(Some(target_identifier.clone()));
+
+        // Hide and position this window so it behaves like a "tab" under the target window.
+        self.0
+            .tab_coordinator
+            .absorb_window_into_group(&target_identifier, target_hwnd, self.0.hwnd);
+    }
+
+    fn tab_bar_visible(&self) -> bool {
+        self.state.tab_bar_visible.get()
+    }
+
+    fn tabbed_windows(&self) -> Option<Vec<SystemWindowTab>> {
+        let identifier = self.0.tabbing_identifier()?;
+        let hwnds = self.0.tab_coordinator.get_group_windows(&identifier);
+
+        // Helper to get window title from HWND
+        let hwnd_title = |hwnd: HWND| -> SharedString {
+            if hwnd.is_invalid() {
+                return SharedString::from("");
+            }
+
+            unsafe {
+                let len = GetWindowTextLengthW(hwnd);
+                if len <= 0 {
+                    return SharedString::from("");
+                }
+
+                let mut buf = vec![0u16; (len as usize) + 1];
+                let copied = GetWindowTextW(hwnd, &mut buf);
+                if copied <= 0 {
+                    return SharedString::from("");
+                }
+
+                buf.truncate(copied as usize);
+                SharedString::from(String::from_utf16_lossy(&buf))
+            }
+        };
+
+        let mut tabs = Vec::new();
+        for hwnd in hwnds {
+            if let Some(inner) = window_from_hwnd(hwnd) {
+                tabs.push(SystemWindowTab::new(hwnd_title(hwnd), inner.handle));
+            }
+        }
+
+        // Ensure the current window is always represented, even if the coordinator state is
+        // momentarily out of sync (e.g. during tabbing initialization).
+        if tabs.is_empty() {
+            tabs.push(SystemWindowTab::new(hwnd_title(self.0.hwnd), self.0.handle));
+        }
+
+        Some(tabs)
+    }
+
+    fn merge_all_windows(&self) {
+        if let Some(mut callback) = self.state.callbacks.merge_all_windows.take() {
+            callback();
+            self.state.callbacks.merge_all_windows.set(Some(callback));
+        }
+
+        let Some(target_identifier) = self.0.tabbing_identifier() else {
+            return;
+        };
+
+        // Ensure every window uses the merged identifier, so our platform coordinator and the
+        // SystemWindowTabController converge on the same grouping.
+        for hwnd in self.0.tab_coordinator.all_windows() {
+            if hwnd == self.0.hwnd {
+                continue;
+            }
+
+            if let Some(inner) = window_from_hwnd(hwnd) {
+                inner.set_tabbing_identifier(Some(target_identifier.clone()));
+            }
+        }
+
+        self.0
+            .tab_coordinator
+            .merge_all(&target_identifier, self.0.hwnd);
+    }
+
+    fn move_tab_to_new_window(&self) {
+        if let Some(mut callback) = self.state.callbacks.move_tab_to_new_window.take() {
+            callback();
+            self.state
+                .callbacks
+                .move_tab_to_new_window
+                .set(Some(callback));
+        }
+
+        let Some(new_identifier) = self.0.tab_coordinator.move_to_new_group(self.0.hwnd) else {
+            return;
+        };
+        self.0.set_tabbing_identifier(Some(new_identifier));
+    }
+
+    fn toggle_window_tab_overview(&self) {
+        let visible = self.state.tab_bar_visible.get();
+        self.state.tab_bar_visible.set(!visible);
+    }
+
+    fn on_move_tab_to_new_window(&self, callback: Box<dyn FnMut()>) {
+        self.state
+            .callbacks
+            .move_tab_to_new_window
+            .set(Some(callback));
+    }
+
+    fn on_merge_all_windows(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.merge_all_windows.set(Some(callback));
+    }
+
+    fn on_select_next_tab(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.select_next_tab.set(Some(callback));
+    }
+
+    fn on_select_previous_tab(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.select_previous_tab.set(Some(callback));
+    }
+
+    fn on_toggle_tab_bar(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.toggle_tab_bar.set(Some(callback));
     }
 }
 

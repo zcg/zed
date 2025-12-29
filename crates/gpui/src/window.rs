@@ -1051,7 +1051,7 @@ impl Window {
             app_id,
             window_min_size,
             window_decorations,
-            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_variables))]
             tabbing_identifier,
         } = options;
 
@@ -1070,9 +1070,15 @@ impl Window {
                 display_id,
                 window_min_size,
                 #[cfg(target_os = "macos")]
-                tabbing_identifier,
+                tabbing_identifier: tabbing_identifier.clone(),
             },
         )?;
+
+        // On Windows, set the tabbing identifier after window creation
+        #[cfg(target_os = "windows")]
+        if tabbing_identifier.is_some() {
+            platform_window.set_tabbing_identifier(tabbing_identifier);
+        }
 
         let tab_bar_visible = platform_window.tab_bar_visible();
         SystemWindowTabController::init_visible(cx, tab_bar_visible);
@@ -1132,7 +1138,7 @@ impl Window {
                                 callback(window, cx);
                             }
                         })
-                        .log_err();
+                        .ok();
                 }
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
@@ -1150,19 +1156,19 @@ impl Window {
                                 window.present();
                                 arena_clear_needed.clear();
                             })
-                            .log_err();
+                            .ok();
                     })
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
-                        .log_err();
+                        .ok();
                 }
 
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
                     })
-                    .log_err();
+                    .ok();
             }
         }));
         platform_window.on_resize(Box::new({
@@ -1170,7 +1176,7 @@ impl Window {
             move |_, _| {
                 handle
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .log_err();
+                    .ok();
             }
         }));
         platform_window.on_moved(Box::new({
@@ -1178,7 +1184,7 @@ impl Window {
             move || {
                 handle
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .log_err();
+                    .ok();
             }
         }));
         platform_window.on_appearance_changed(Box::new({
@@ -1186,7 +1192,7 @@ impl Window {
             move || {
                 handle
                     .update(&mut cx, |_, window, cx| window.appearance_changed(cx))
-                    .log_err();
+                    .ok();
             }
         }));
         platform_window.on_active_status_change(Box::new({
@@ -1207,7 +1213,7 @@ impl Window {
 
                         SystemWindowTabController::update_last_active(cx, window.handle.id);
                     })
-                    .log_err();
+                    .ok();
             }
         }));
         platform_window.on_hover_status_change(Box::new({
@@ -1218,7 +1224,7 @@ impl Window {
                         window.hovered.set(active);
                         window.refresh();
                     })
-                    .log_err();
+                    .ok();
             }
         }));
         platform_window.on_input({
@@ -1226,7 +1232,7 @@ impl Window {
             Box::new(move |event| {
                 handle
                     .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
-                    .log_err()
+                    .ok()
                     .unwrap_or(DispatchEventResult::default())
             })
         });
@@ -1242,29 +1248,63 @@ impl Window {
                         }
                         None
                     })
-                    .log_err()
+                    .ok()
                     .unwrap_or(None)
             })
         });
         platform_window.on_move_tab_to_new_window({
-            let mut cx = cx.to_async();
-            Box::new(move || {
-                handle
-                    .update(&mut cx, |_, _window, cx| {
-                        SystemWindowTabController::move_tab_to_new_window(cx, handle.window_id());
+            // On Windows, Zed's custom tab bar updates the `SystemWindowTabController`
+            // directly at the call site (within the same `App` update), so we keep this
+            // callback as a no-op to avoid re-entrant `AsyncApp` borrows.
+            #[cfg(target_os = "windows")]
+            let callback: Box<dyn FnMut()> = Box::new(|| {});
+
+            #[cfg(not(target_os = "windows"))]
+            let callback: Box<dyn FnMut()> = {
+                let cx = cx.to_async();
+                Box::new(move || {
+                    let mut cx = cx.clone();
+                    cx.spawn(async move |cx| {
+                        handle
+                            .update(cx, |_, _window, cx| {
+                                SystemWindowTabController::move_tab_to_new_window(
+                                    cx,
+                                    handle.window_id(),
+                                );
+                                SystemWindowTabController::refresh_all_windows(cx);
+                            })
+                            .log_err();
                     })
-                    .log_err();
-            })
+                    .detach();
+                })
+            };
+
+            callback
         });
         platform_window.on_merge_all_windows({
-            let mut cx = cx.to_async();
-            Box::new(move || {
-                handle
-                    .update(&mut cx, |_, _window, cx| {
-                        SystemWindowTabController::merge_all_windows(cx, handle.window_id());
+            // On Windows, Zed updates the controller at the call site; keep this a no-op
+            // to avoid re-entrant `AsyncApp` borrows during input handlers.
+            #[cfg(target_os = "windows")]
+            let callback: Box<dyn FnMut()> = Box::new(|| {});
+
+            #[cfg(not(target_os = "windows"))]
+            let callback: Box<dyn FnMut()> = {
+                let cx = cx.to_async();
+                Box::new(move || {
+                    let mut cx = cx.clone();
+                    cx.spawn(async move |cx| {
+                        handle
+                            .update(cx, |_, _window, cx| {
+                                SystemWindowTabController::merge_all_windows(cx, handle.window_id());
+                                SystemWindowTabController::refresh_all_windows(cx);
+                            })
+                            .log_err();
                     })
-                    .log_err();
-            })
+                    .detach();
+                })
+            };
+
+            callback
         });
         platform_window.on_select_next_tab({
             let mut cx = cx.to_async();
@@ -1273,7 +1313,7 @@ impl Window {
                     .update(&mut cx, |_, _window, cx| {
                         SystemWindowTabController::select_next_tab(cx, handle.window_id());
                     })
-                    .log_err();
+                    .ok();
             })
         });
         platform_window.on_select_previous_tab({
@@ -1283,7 +1323,7 @@ impl Window {
                     .update(&mut cx, |_, _window, cx| {
                         SystemWindowTabController::select_previous_tab(cx, handle.window_id())
                     })
-                    .log_err();
+                    .ok();
             })
         });
         platform_window.on_toggle_tab_bar({
@@ -1294,7 +1334,7 @@ impl Window {
                         let tab_bar_visible = window.platform_window.tab_bar_visible();
                         SystemWindowTabController::set_visible(cx, tab_bar_visible);
                     })
-                    .log_err();
+                    .ok();
             })
         });
 
@@ -4652,6 +4692,34 @@ impl Window {
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         self.platform_window
             .set_tabbing_identifier(tabbing_identifier)
+    }
+
+    /// Returns the tabbing identifier for the window (if any).
+    ///
+    /// On Windows, windows with the same identifier are "virtually tabbed" together by the
+    /// platform layer. On other platforms this may return `None`.
+    pub fn tabbing_identifier(&self) -> Option<String> {
+        self.platform_window.tabbing_identifier()
+    }
+
+    /// Returns the raw Win32 window handle for this window.
+    #[cfg(target_os = "windows")]
+    pub fn raw_handle(&self) -> crate::HWND {
+        self.platform_window.get_raw_handle()
+    }
+
+    /// Merge this window into an existing tab group on Windows.
+    ///
+    /// This makes the current window behave like a "tab" under the target window by adopting its
+    /// tabbing identifier and then hiding/positioning it underneath the target.
+    #[cfg(target_os = "windows")]
+    pub fn merge_into_tabbing_group(
+        &self,
+        target_identifier: String,
+        target_hwnd: crate::HWND,
+    ) {
+        self.platform_window
+            .merge_into_tabbing_group(target_identifier, target_hwnd)
     }
 
     /// Toggles the inspector mode on this window.

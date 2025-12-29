@@ -1,8 +1,9 @@
 use settings::{Settings, SettingsStore};
 
 use gpui::{
-    AnyWindowHandle, Context, Hsla, InteractiveElement, MouseButton, ParentElement, ScrollHandle,
-    Styled, SystemWindowTab, SystemWindowTabController, Window, WindowId, actions, canvas, div,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, Hsla, InteractiveElement, MouseButton,
+    DragMoveEvent, ParentElement, ScrollHandle, Styled, SystemWindowTab, SystemWindowTabController,
+    Window, WindowId, actions, canvas, div, point, size,
 };
 
 use theme::ThemeSettings;
@@ -24,6 +25,9 @@ actions!(
         MoveTabToNewWindow
     ]
 );
+
+#[cfg(target_os = "windows")]
+use gpui::{SystemWindowTabBarMetrics, SystemWindowTabDragPreview};
 
 #[derive(Clone)]
 pub struct DraggedWindowTab {
@@ -56,6 +60,13 @@ impl SystemWindowTabs {
         let mut was_use_system_window_tabs =
             WorkspaceSettings::get_global(cx).use_system_window_tabs;
 
+        // Initialize on startup if setting is already enabled
+        if was_use_system_window_tabs {
+            SystemWindowTabController::init(cx);
+            #[cfg(target_os = "windows")]
+            SystemWindowTabController::set_visible(cx, true);
+        }
+
         cx.observe_global::<SettingsStore>(move |cx| {
             let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
             if use_system_window_tabs == was_use_system_window_tabs {
@@ -71,10 +82,15 @@ impl SystemWindowTabs {
 
             if use_system_window_tabs {
                 SystemWindowTabController::init(cx);
+                // On Windows, we need to explicitly set visibility since
+                // there's no native tab bar to query
+                #[cfg(target_os = "windows")]
+                SystemWindowTabController::set_visible(cx, true);
             }
 
             cx.windows().iter().for_each(|handle| {
-                let _ = handle.update(cx, |_, window, cx| {
+                handle
+                    .update(cx, |_, window, cx| {
                     window.set_tabbing_identifier(tabbing_identifier.clone());
                     if use_system_window_tabs {
                         let tabs = if let Some(tabs) = window.tabbed_windows() {
@@ -88,7 +104,8 @@ impl SystemWindowTabs {
 
                         SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
                     }
-                });
+                })
+                    .ok();
             });
         })
         .detach();
@@ -118,19 +135,29 @@ impl SystemWindowTabs {
                         );
                     })
                     .on_action(move |_: &MoveTabToNewWindow, window, cx| {
-                        SystemWindowTabController::move_tab_to_new_window(
-                            cx,
-                            window.window_handle().window_id(),
-                        );
+                        #[cfg(target_os = "windows")]
+                        {
+                            SystemWindowTabController::move_tab_to_new_window(
+                                cx,
+                                window.window_handle().window_id(),
+                            );
+                            SystemWindowTabController::refresh_all_windows(cx);
+                        }
+
                         window.move_tab_to_new_window();
                     })
                 })
                 .when(tab_groups.len() > 1, |div| {
                     div.on_action(move |_: &MergeAllWindows, window, cx| {
-                        SystemWindowTabController::merge_all_windows(
-                            cx,
-                            window.window_handle().window_id(),
-                        );
+                        #[cfg(target_os = "windows")]
+                        {
+                            SystemWindowTabController::merge_all_windows(
+                                cx,
+                                window.window_handle().window_id(),
+                            );
+                            SystemWindowTabController::refresh_all_windows(cx);
+                        }
+
                         window.merge_all_windows();
                     })
                 })
@@ -217,23 +244,52 @@ impl SystemWindowTabs {
             })
             .on_drop({
                 let tab_ix = ix;
-                cx.listener(move |this, dragged_tab: &DraggedWindowTab, _window, cx| {
+                let target_window_id = item.id;
+                cx.listener(move |this, dragged_tab: &DraggedWindowTab, window, cx| {
                     this.last_dragged_tab = None;
-                    Self::handle_tab_drop(dragged_tab, tab_ix, cx);
+                    #[cfg(target_os = "windows")]
+                    Self::clear_drag_preview(cx);
+                    #[cfg(target_os = "windows")]
+                    {
+                        let same_group = cx
+                            .global::<SystemWindowTabController>()
+                            .tabs(target_window_id)
+                            .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == dragged_tab.id));
+
+                        if same_group {
+                            Self::handle_tab_drop(dragged_tab, tab_ix, target_window_id, window, cx);
+                        } else {
+                            let dragged_tab = dragged_tab.clone();
+                            cx.defer(move |cx| {
+                                Self::merge_tab_into_target_group(
+                                    cx,
+                                    dragged_tab,
+                                    target_window_id,
+                                    tab_ix,
+                                );
+                            });
+                        }
+                        return;
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
+                    Self::handle_tab_drop(dragged_tab, tab_ix, target_window_id, window, cx);
                 })
             })
             .on_click(move |_, _, cx| {
-                let _ = item.handle.update(cx, |_, window, _| {
-                    window.activate_window();
-                });
+                item.handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .ok();
             })
             .on_mouse_up(MouseButton::Middle, move |_, window, cx| {
                 if item.handle.window_id() == window.window_handle().window_id() {
                     window.dispatch_action(Box::new(CloseWindow), cx);
                 } else {
-                    let _ = item.handle.update(cx, |_, window, cx| {
-                        window.dispatch_action(Box::new(CloseWindow), cx);
-                    });
+                    item.handle
+                        .update(cx, |_, window, cx| {
+                            window.dispatch_action(Box::new(CloseWindow), cx);
+                        })
+                        .ok();
                 }
             })
             .child(label)
@@ -261,9 +317,14 @@ impl SystemWindowTabs {
                                         {
                                             window.dispatch_action(Box::new(CloseWindow), cx);
                                         } else {
-                                            let _ = item.handle.update(cx, |_, window, cx| {
-                                                window.dispatch_action(Box::new(CloseWindow), cx);
-                                            });
+                                            item.handle
+                                                .update(cx, |_, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(CloseWindow),
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
                                         }
                                     }
                                 })
@@ -284,8 +345,9 @@ impl SystemWindowTabs {
                 let other_tabs = tabs.clone();
                 let move_tabs = tabs.clone();
                 let merge_tabs = tabs.clone();
+                let merge_all_tabs = tabs.clone();
 
-                ContextMenu::build(window, cx, move |mut menu, _window_, _cx| {
+                ContextMenu::build(window, cx, move |mut menu, _window_, cx| {
                     menu = menu.entry("Close Tab", None, move |window, cx| {
                         Self::handle_right_click_action(
                             cx,
@@ -317,14 +379,44 @@ impl SystemWindowTabs {
                             &move_tabs,
                             |tab| tab.id == item.id,
                             |window, cx| {
-                                SystemWindowTabController::move_tab_to_new_window(
-                                    cx,
-                                    window.window_handle().window_id(),
-                                );
+                                #[cfg(target_os = "windows")]
+                                {
+                                    SystemWindowTabController::move_tab_to_new_window(
+                                        cx,
+                                        window.window_handle().window_id(),
+                                    );
+                                    SystemWindowTabController::refresh_all_windows(cx);
+                                }
+
                                 window.move_tab_to_new_window();
                             },
                         );
                     });
+
+                    // Add "Merge All Windows" when there are multiple tab groups
+                    let controller = cx.global::<SystemWindowTabController>();
+                    if controller.tab_groups_count() > 1 {
+                        menu = menu.entry("Merge All Windows", None, move |window, cx| {
+                            Self::handle_right_click_action(
+                                cx,
+                                window,
+                                &merge_all_tabs,
+                                |tab| tab.id == item.id,
+                                |window, cx| {
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        SystemWindowTabController::merge_all_windows(
+                                            cx,
+                                            window.window_handle().window_id(),
+                                        );
+                                        SystemWindowTabController::refresh_all_windows(cx);
+                                    }
+
+                                    window.merge_all_windows();
+                                },
+                            );
+                        });
+                    }
 
                     menu = menu.entry("Show All Tabs", None, move |window, cx| {
                         Self::handle_right_click_action(
@@ -355,8 +447,114 @@ impl SystemWindowTabs {
             .child(menu)
     }
 
-    fn handle_tab_drop(dragged_tab: &DraggedWindowTab, ix: usize, cx: &mut Context<Self>) {
-        SystemWindowTabController::update_tab_position(cx, dragged_tab.id, ix);
+    fn handle_tab_drop(
+        dragged_tab: &DraggedWindowTab,
+        ix: usize,
+        target_window_id: WindowId,
+        _target_window: &mut Window,
+        cx: &mut App,
+    ) {
+        let controller = cx.global::<SystemWindowTabController>();
+        let same_group = controller
+            .tabs(target_window_id)
+            .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == dragged_tab.id));
+
+        if same_group {
+            let controller = cx.global::<SystemWindowTabController>();
+            let clamped_ix = controller
+                .tabs(target_window_id)
+                .map(|tabs| ix.min(tabs.len().saturating_sub(1)))
+                .unwrap_or(ix);
+
+            SystemWindowTabController::update_tab_position(cx, dragged_tab.id, clamped_ix);
+            return;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn merge_tab_into_target_group(
+        cx: &mut App,
+        dragged_tab: DraggedWindowTab,
+        target_window_id: WindowId,
+        ix: usize,
+    ) {
+        let Some(target_handle) = cx
+            .windows()
+            .into_iter()
+            .find(|h| h.window_id() == target_window_id)
+        else {
+            return;
+        };
+
+        let Ok((target_identifier, target_hwnd)) =
+            target_handle.update(cx, |_, target_window, _| {
+                (target_window.tabbing_identifier(), target_window.raw_handle())
+            })
+        else {
+            return;
+        };
+
+        let Some(target_identifier) = target_identifier else {
+            return;
+        };
+
+        // Perform platform merge by updating the dragged window (no nested window updates).
+        if dragged_tab.id != target_window_id {
+            if dragged_tab
+                .handle
+                .update(cx, |_, dragged_window, _| {
+                    dragged_window.merge_into_tabbing_group(target_identifier.clone(), target_hwnd);
+                })
+                .is_err()
+            {
+                return;
+            }
+        } else {
+            // Dragging the active tab "into itself" is a no-op.
+            return;
+        }
+
+        // Snapshot the target group after the platform coordinator updates.
+        let Ok(tabs) = target_handle.update(cx, |_, target_window, _| target_window.tabbed_windows())
+        else {
+            return;
+        };
+        let Some(tabs) = tabs else {
+            return;
+        };
+
+        // Update controller to match the platform grouping.
+        SystemWindowTabController::remove_tab(cx, dragged_tab.id);
+        SystemWindowTabController::add_tab(cx, target_window_id, tabs);
+        let controller = cx.global::<SystemWindowTabController>();
+        let clamped_ix = controller
+            .tabs(target_window_id)
+            .map(|tabs| ix.min(tabs.len().saturating_sub(1)))
+            .unwrap_or(ix);
+        SystemWindowTabController::update_tab_position(cx, dragged_tab.id, clamped_ix);
+        SystemWindowTabController::refresh_all_windows(cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn clear_drag_preview(cx: &mut App) {
+        let previous = cx.global::<SystemWindowTabController>().drag_preview();
+        if SystemWindowTabController::set_drag_preview(cx, None) {
+            if let Some(previous) = previous {
+                Self::refresh_window_ids(cx, [previous.target_window_id]);
+            } else {
+                SystemWindowTabController::refresh_all_windows(cx);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn refresh_window_ids(cx: &mut App, window_ids: impl IntoIterator<Item = WindowId>) {
+        let ids = window_ids.into_iter().collect::<std::collections::HashSet<_>>();
+        for handle in cx.windows() {
+            if ids.contains(&handle.window_id()) {
+                handle.update(cx, |_, window, _| window.refresh()).ok();
+            }
+        }
     }
 
     fn handle_right_click_action<F, P>(
@@ -374,9 +572,11 @@ impl SystemWindowTabs {
                 if tab.id == window.window_handle().window_id() {
                     action(window, cx);
                 } else {
-                    let _ = tab.handle.update(cx, |_view, window, cx| {
-                        action(window, cx);
-                    });
+                    tab.handle
+                        .update(cx, |_view, window, cx| {
+                            action(window, cx);
+                        })
+                        .ok();
                 }
             }
         }
@@ -390,18 +590,37 @@ impl Render for SystemWindowTabs {
         let inactive_background_color = cx.theme().colors().tab_bar_background;
         let entity = cx.entity();
 
-        let controller = cx.global::<SystemWindowTabController>();
-        let visible = controller.is_visible();
+        let window_id = window.window_handle().window_id();
+        let visible = cx.global::<SystemWindowTabController>().is_visible();
         let current_window_tab = vec![SystemWindowTab::new(
             SharedString::from(window.window_title()),
             window.window_handle(),
         )];
-        let tabs = controller
-            .tabs(window.window_handle().window_id())
+        let tabs = cx
+            .global::<SystemWindowTabController>()
+            .tabs(window_id)
             .unwrap_or(&current_window_tab)
             .clone();
 
-        let tab_items = tabs
+        let tab_width = self.measured_tab_width.max(window.rem_size() * 10.);
+
+        #[cfg(target_os = "windows")]
+        {
+            SystemWindowTabController::set_tab_bar_metrics(
+                cx,
+                window_id,
+                SystemWindowTabBarMetrics {
+                    tab_width,
+                    scroll_offset_x: self.tab_bar_scroll_handle.offset().x,
+                    tab_count: tabs.len().max(1),
+                },
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        let drag_preview = cx.global::<SystemWindowTabController>().drag_preview();
+
+        let mut tab_items = tabs
             .iter()
             .enumerate()
             .map(|(ix, item)| {
@@ -414,31 +633,162 @@ impl Render for SystemWindowTabs {
                     window,
                     cx,
                 )
+                .into_any_element()
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<AnyElement>>();
 
-        let number_of_tabs = tab_items.len().max(1);
+        #[cfg(target_os = "windows")]
+        if let Some(preview) = drag_preview
+            && preview.target_window_id == window_id
+            && cx.has_active_drag()
+        {
+            let placeholder = h_flex()
+                .h(Tab::container_height(cx))
+                .w(tab_width)
+                .bg(cx.theme().colors().drop_target_background)
+                .border_1()
+                .border_color(cx.theme().colors().drop_target_border)
+                .opacity(0.55)
+                .into_any_element();
+
+            let insert_ix = preview.insert_ix.min(tab_items.len());
+            tab_items.insert(insert_ix, placeholder);
+        }
+
+        let number_of_tabs = tabs.len().max(1);
         if (!window.tab_bar_visible() && !visible)
             || (!use_system_window_tabs && number_of_tabs == 1)
         {
             return h_flex().into_any_element();
         }
 
-        h_flex()
+        let tab_bar = h_flex()
             .w_full()
             .h(Tab::container_height(cx))
-            .bg(inactive_background_color)
+            .bg(inactive_background_color);
+
+        #[cfg(target_os = "windows")]
+        let tab_bar = tab_bar.on_drag_move::<DraggedWindowTab>(cx.listener(
+            |this, event: &DragMoveEvent<DraggedWindowTab>, window, cx| {
+                    let Some(dragged_tab) = event.dragged_item().downcast_ref::<DraggedWindowTab>()
+                    else {
+                        return;
+                    };
+
+                    let global_pos = window.bounds().origin + event.event.position;
+                    let mut next_preview: Option<SystemWindowTabDragPreview> = None;
+
+                    // Prefer top-most windows when multiple overlap.
+                    let windows = cx.window_stack().unwrap_or_else(|| cx.windows());
+                    for handle in windows {
+                        let Ok((target_window_id, bounds)) =
+                            handle.update(cx, |_, target_window, _| {
+                                (target_window.window_handle().window_id(), target_window.bounds())
+                            })
+                        else {
+                            continue;
+                        };
+
+                        // Only preview within the window tab bar area.
+                        // On Windows, `PlatformTitleBar::height` is currently fixed at 32px.
+                        let tab_bar_bounds = Bounds::new(
+                            point(bounds.origin.x, bounds.origin.y + px(32.)),
+                            size(bounds.size.width, Tab::container_height(cx)),
+                        );
+
+                        if !tab_bar_bounds.contains(&global_pos) {
+                            continue;
+                        }
+
+                        let (tab_width, scroll_offset_x, tab_count) = {
+                            let controller = cx.global::<SystemWindowTabController>();
+                            let tab_count = controller
+                                .tabs(target_window_id)
+                                .map(|tabs| tabs.len())
+                                .unwrap_or(1);
+                            let metrics = controller.tab_bar_metrics(target_window_id).copied();
+                            let tab_width = metrics.map(|m| m.tab_width).unwrap_or(px(0.));
+                            let scroll_offset_x =
+                                metrics.map(|m| m.scroll_offset_x).unwrap_or(px(0.));
+                            (tab_width, scroll_offset_x, tab_count)
+                        };
+
+                        let insert_ix = if tab_width > px(0.) {
+                            let local_x = (global_pos.x - bounds.origin.x) + scroll_offset_x;
+                            ((local_x / tab_width).floor() as usize).min(tab_count)
+                        } else {
+                            tab_count
+                        };
+
+                        next_preview = Some(SystemWindowTabDragPreview {
+                            target_window_id,
+                            insert_ix,
+                        });
+                        break;
+                    }
+
+                    let previous = cx.global::<SystemWindowTabController>().drag_preview();
+                    if SystemWindowTabController::set_drag_preview(cx, next_preview) {
+                        // Only refresh windows that could visually change (previous target, new target,
+                        // and the source window rendering the drag).
+                        let mut to_refresh = Vec::new();
+                        if let Some(prev) = previous {
+                            to_refresh.push(prev.target_window_id);
+                        }
+                        if let Some(next) = next_preview {
+                            to_refresh.push(next.target_window_id);
+                        }
+                        to_refresh.push(window.window_handle().window_id());
+                        Self::refresh_window_ids(cx, to_refresh);
+                    }
+
+                    // `on_mouse_up_out` uses this to decide whether to detach.
+                    if this.last_dragged_tab.is_none() {
+                        this.last_dragged_tab = Some(dragged_tab.clone());
+                    }
+            },
+        ));
+
+        tab_bar
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {
                     if let Some(tab) = this.last_dragged_tab.take() {
-                        SystemWindowTabController::move_tab_to_new_window(cx, tab.id);
+                        #[cfg(target_os = "windows")]
+                        {
+                            let preview = cx.global::<SystemWindowTabController>().drag_preview();
+                            Self::clear_drag_preview(cx);
+
+                            if let Some(preview) = preview
+                                && cx
+                                    .windows()
+                                    .into_iter()
+                                    .any(|h| h.window_id() == preview.target_window_id)
+                            {
+                                let tab_for_merge = tab;
+                                cx.defer(move |cx| {
+                                    Self::merge_tab_into_target_group(
+                                        cx,
+                                        tab_for_merge,
+                                        preview.target_window_id,
+                                        preview.insert_ix,
+                                    );
+                                });
+                                return;
+                            }
+
+                            // No valid merge target: detach.
+                            SystemWindowTabController::move_tab_to_new_window(cx, tab.id);
+                            SystemWindowTabController::refresh_all_windows(cx);
+                        }
+
+                        // Perform the platform operation to actually detach into a new group.
                         if tab.id == window.window_handle().window_id() {
                             window.move_tab_to_new_window();
                         } else {
-                            let _ = tab.handle.update(cx, |_, window, _cx| {
-                                window.move_tab_to_new_window();
-                            });
+                            tab.handle
+                                .update(cx, |_, window, _cx| window.move_tab_to_new_window())
+                                .ok();
                         }
                     }
                 }),
@@ -449,6 +799,52 @@ impl Render for SystemWindowTabs {
                     .w_full()
                     .h(Tab::container_height(cx))
                     .bg(inactive_background_color)
+                    .drag_over::<DraggedWindowTab>(move |element, _dragged_tab, _, cx| {
+                        element
+                            .bg(cx.theme().colors().drop_target_background)
+                            .border_color(cx.theme().colors().drop_target_border)
+                            .border_0()
+                    })
+                    .on_drop({
+                        let target_window_id = window.window_handle().window_id();
+                        cx.listener(move |this, dragged_tab: &DraggedWindowTab, window, cx| {
+                            this.last_dragged_tab = None;
+                            #[cfg(target_os = "windows")]
+                            Self::clear_drag_preview(cx);
+                            #[cfg(target_os = "windows")]
+                            {
+                                let same_group = cx
+                                    .global::<SystemWindowTabController>()
+                                    .tabs(target_window_id)
+                                    .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == dragged_tab.id));
+
+                                if same_group {
+                                    Self::handle_tab_drop(
+                                        dragged_tab,
+                                        usize::MAX,
+                                        target_window_id,
+                                        window,
+                                        cx,
+                                    );
+                                    return;
+                                }
+
+                                let dragged_tab = dragged_tab.clone();
+                                cx.defer(move |cx| {
+                                    Self::merge_tab_into_target_group(
+                                        cx,
+                                        dragged_tab,
+                                        target_window_id,
+                                        usize::MAX,
+                                    );
+                                });
+                                return;
+                            }
+
+                            #[cfg(not(target_os = "windows"))]
+                            Self::handle_tab_drop(dragged_tab, usize::MAX, target_window_id, window, cx);
+                        })
+                    })
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_bar_scroll_handle)
                     .children(tab_items)
