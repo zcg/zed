@@ -464,9 +464,99 @@ pub fn initialize_workspace(
 
         let handle = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
+            #[cfg(target_os = "windows")]
+            {
+                if WorkspaceSettings::get_global(cx).use_system_window_tabs {
+                    let window_id = window.window_handle().window_id();
+                    let tabs = cx
+                        .global::<gpui::SystemWindowTabController>()
+                        .tabs(window_id)
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if tabs.len() > 1 {
+                        let prompt_window = window.window_handle();
+                        let current_workspace_window = prompt_window.downcast::<Workspace>();
+
+                        let mut group_workspace_windows = Vec::new();
+                        for tab in tabs {
+                            if let Some(workspace_window) = tab.handle.downcast::<Workspace>() {
+                                if !group_workspace_windows
+                                    .iter()
+                                    .any(|existing: &gpui::WindowHandle<Workspace>| {
+                                        existing.window_id() == workspace_window.window_id()
+                                    })
+                                {
+                                    group_workspace_windows.push(workspace_window);
+                                }
+                            }
+                        }
+
+                        if group_workspace_windows.len() <= 1 || current_workspace_window.is_none() {
+                            return handle
+                                .update(cx, |workspace, cx| {
+                                    workspace.close_window(&CloseWindow, window, cx);
+                                    false
+                                })
+                                .unwrap_or(true);
+                        }
+
+                        cx.spawn(async move |cx| {
+                            let detail = format!(
+                                "This window is part of a merged group ({} windows).",
+                                group_workspace_windows.len()
+                            );
+                            let prompt = prompt_window.update(cx, |_, window, cx| {
+                                window.prompt(
+                                    PromptLevel::Warning,
+                                    "Close merged window group?",
+                                    Some(&detail),
+                                    &["Close window", "Close group", "Cancel"],
+                                    cx,
+                                )
+                            });
+
+                            let Ok(prompt) = prompt else {
+                                return;
+                            };
+
+                            let Ok(choice) = prompt.await else {
+                                return;
+                            };
+
+                            match choice {
+                                0 => {
+                                    if let Some(current_workspace_window) =
+                                        current_workspace_window
+                                    {
+                                        current_workspace_window
+                                            .update(cx, |workspace, window, cx| {
+                                                workspace.close_window(&CloseWindow, window, cx);
+                                            })
+                                            .ok();
+                                    };
+                                }
+                                1 => {
+                                    for workspace_window in group_workspace_windows {
+                                        workspace_window
+                                            .update(cx, |workspace, window, cx| {
+                                                workspace.close_window(&CloseWindow, window, cx);
+                                            })
+                                            .ok();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        })
+                        .detach();
+
+                        return false;
+                    }
+                }
+            }
+
             handle
                 .update(cx, |workspace, cx| {
-                    // We'll handle closing asynchronously
                     workspace.close_window(&CloseWindow, window, cx);
                     false
                 })
