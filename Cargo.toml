@@ -854,7 +854,7 @@ debug = 0
 incremental = false
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+zed = { codegen-units = 1 }
 
 [profile.release-fast]
 inherits = "release"
