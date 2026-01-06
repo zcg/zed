@@ -52,6 +52,8 @@ use crate::{
 use anyhow::Result;
 use async_task::Runnable;
 use futures::channel::oneshot;
+#[cfg(any(test, feature = "test-support"))]
+use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -581,15 +583,43 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
     }
+
+    /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
+    /// This does not present the frame to screen - useful for visual testing where we want
+    /// to capture what would be rendered without displaying it or requiring the window to be visible.
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
+        anyhow::bail!("render_to_image not implemented for this platform")
+    }
 }
 
 /// This type is public so that our test macro can generate and use it, but it should not
 /// be considered part of our public API.
 #[doc(hidden)]
-#[derive(Debug)]
 pub struct RunnableMeta {
     /// Location of the runnable
     pub location: &'static core::panic::Location<'static>,
+    /// Weak reference to check if the app is still alive before running this task
+    pub app: Option<std::sync::Weak<()>>,
+}
+
+impl std::fmt::Debug for RunnableMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnableMeta")
+            .field("location", &self.location)
+            .field("app_alive", &self.is_app_alive())
+            .finish()
+    }
+}
+
+impl RunnableMeta {
+    /// Returns true if the app is still alive (or if no app tracking is configured).
+    pub fn is_app_alive(&self) -> bool {
+        match &self.app {
+            Some(weak) => weak.strong_count() > 0,
+            None => true,
+        }
+    }
 }
 
 #[doc(hidden)]

@@ -1,6 +1,6 @@
 use crate::{
-    Anchor, Autoscroll, BufferSerialization, Editor, EditorEvent, EditorSettings, ExcerptId,
-    ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
+    Anchor, Autoscroll, BufferSerialization, Capability, Editor, EditorEvent, EditorSettings,
+    ExcerptId, ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
     ReportEditorEvent, SearchWithinRange, SelectionEffects, ToPoint as _,
     display_map::HighlightKey,
     editor_settings::SeedQuerySetting,
@@ -803,6 +803,29 @@ impl Item for Editor {
 
     fn is_dirty(&self, cx: &App) -> bool {
         self.buffer().read(cx).read(cx).is_dirty()
+    }
+
+    fn capability(&self, cx: &App) -> Capability {
+        self.capability(cx)
+    }
+
+    // Note: this mirrors the logic in `Editor::toggle_read_only`, but is reachable
+    // without relying on focus-based action dispatch.
+    fn toggle_read_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(buffer) = self.buffer.read(cx).as_singleton() {
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_capability(
+                    match buffer.capability() {
+                        Capability::ReadWrite => Capability::Read,
+                        Capability::Read => Capability::ReadWrite,
+                        Capability::ReadOnly => Capability::ReadOnly,
+                    },
+                    cx,
+                );
+            });
+        }
+        cx.notify();
+        window.refresh();
     }
 
     fn has_deleted_file(&self, cx: &App) -> bool {
@@ -1659,19 +1682,27 @@ impl SearchableItem for Editor {
         let text = text.snapshot(cx);
         let mut edits = vec![];
 
-        for m in matches {
-            let text = text.text_for_range(m.clone()).collect::<Vec<_>>();
+        // A regex might have replacement variables so we cannot apply
+        // the same replacement to all matches
+        if query.is_regex() {
+            edits = matches
+                .filter_map(|m| {
+                    let text = text.text_for_range(m.clone()).collect::<Vec<_>>();
 
-            let text: Cow<_> = if text.len() == 1 {
-                text.first().cloned().unwrap().into()
-            } else {
-                let joined_chunks = text.join("");
-                joined_chunks.into()
-            };
+                    let text: Cow<_> = if text.len() == 1 {
+                        text.first().cloned().unwrap().into()
+                    } else {
+                        let joined_chunks = text.join("");
+                        joined_chunks.into()
+                    };
 
-            if let Some(replacement) = query.replacement_for(&text) {
-                edits.push((m.clone(), Arc::from(&*replacement)));
-            }
+                    query
+                        .replacement_for(&text)
+                        .map(|replacement| (m.clone(), Arc::from(&*replacement)))
+                })
+                .collect();
+        } else if let Some(replacement) = query.replacement().map(Arc::<str>::from) {
+            edits = matches.map(|m| (m.clone(), replacement.clone())).collect();
         }
 
         if !edits.is_empty() {
