@@ -844,9 +844,14 @@ ui_input = { codegen-units = 1 }
 zed_actions = { codegen-units = 1 }
 
 [profile.release]
-debug = "limited"
-lto = "thin"
+# 极致优化：更小体积 + 最大优化；关闭调试信息
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+incremental = false
 
 [profile.release.package]
 zed = { codegen-units = 16 }
