@@ -1037,8 +1037,9 @@ impl LocalLspStore {
                     let this = this.clone();
                     let mut cx = cx.clone();
                     async move {
-                        this.update(&mut cx, |lsp_store, _| {
+                        this.update(&mut cx, |lsp_store, cx| {
                             lsp_store.pull_workspace_diagnostics(server_id);
+                            lsp_store.pull_document_diagnostics_for_server(server_id, cx);
                             lsp_store
                                 .downstream_client
                                 .as_ref()
@@ -4665,7 +4666,7 @@ impl LspStore {
         let Some(language) = buffer.read(cx).language().cloned() else {
             return false;
         };
-        let relevant_language_servers = self
+        let registered_language_servers = self
             .languages
             .lsp_adapters(&language.name())
             .into_iter()
@@ -4674,9 +4675,13 @@ impl LspStore {
         self.language_server_statuses
             .iter()
             .filter_map(|(server_id, server_status)| {
-                relevant_language_servers
-                    .contains(&server_status.name)
-                    .then_some(server_id)
+                // Include servers that are either registered for this language OR
+                // available to be loaded (for SSH remote mode where adapters like
+                // ty/pylsp/pyright are registered via register_available_lsp_adapter
+                // but only loaded on the server side)
+                let is_relevant = registered_language_servers.contains(&server_status.name)
+                    || self.languages.is_lsp_adapter_available(&server_status.name);
+                is_relevant.then_some(server_id)
             })
             .filter_map(|server_id| self.lsp_server_capabilities.get(server_id))
             .any(check)
@@ -4694,7 +4699,7 @@ impl LspStore {
         let Some(language) = buffer.read(cx).language().cloned() else {
             return Vec::default();
         };
-        let relevant_language_servers = self
+        let registered_language_servers = self
             .languages
             .lsp_adapters(&language.name())
             .into_iter()
@@ -4703,9 +4708,13 @@ impl LspStore {
         self.language_server_statuses
             .iter()
             .filter_map(|(server_id, server_status)| {
-                relevant_language_servers
-                    .contains(&server_status.name)
-                    .then_some((server_id, &server_status.name))
+                // Include servers that are either registered for this language OR
+                // available to be loaded (for SSH remote mode where adapters like
+                // ty/pylsp/pyright are registered via register_available_lsp_adapter
+                // but only loaded on the server side)
+                let is_relevant = registered_language_servers.contains(&server_status.name)
+                    || self.languages.is_lsp_adapter_available(&server_status.name);
+                is_relevant.then_some((server_id, &server_status.name))
             })
             .filter_map(|(server_id, server_name)| {
                 self.lsp_server_capabilities
@@ -6529,8 +6538,9 @@ impl LspStore {
 
         let mut new_label = match completion_item {
             Some(completion_item) => {
-                // NB: Zed does not have `details` inside the completion resolve capabilities, but certain language servers violate the spec and do not return `details` immediately, e.g. https://github.com/yioneko/vtsls/issues/213
-                // So we have to update the label here anyway...
+                // Some language servers always return `detail` lazily via resolve, regardless of
+                // the resolvable properties Zed advertises. Regenerate labels here to handle this.
+                // See: https://github.com/yioneko/vtsls/issues/213
                 let language = snapshot.language();
                 match language {
                     Some(language) => {
@@ -12183,26 +12193,31 @@ impl LspStore {
         }
     }
 
-    pub fn pull_workspace_diagnostics_for_buffer(&mut self, buffer_id: BufferId, cx: &mut App) {
-        let Some(buffer) = self.buffer_store().read(cx).get_existing(buffer_id).ok() else {
-            return;
-        };
-        let Some(local) = self.as_local_mut() else {
-            return;
-        };
+    /// Refreshes `textDocument/diagnostic` for all open buffers associated with the given server.
+    /// This is called in response to `workspace/diagnostic/refresh` to comply with the LSP spec,
+    /// which requires refreshing both workspace and document diagnostics.
+    pub fn pull_document_diagnostics_for_server(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        let buffers_to_pull: Vec<_> = self
+            .as_local()
+            .into_iter()
+            .flat_map(|local| {
+                self.buffer_store.read(cx).buffers().filter(|buffer| {
+                    let buffer_id = buffer.read(cx).remote_id();
+                    local
+                        .buffers_opened_in_servers
+                        .get(&buffer_id)
+                        .is_some_and(|servers| servers.contains(&server_id))
+                })
+            })
+            .collect();
 
-        for server_id in buffer.update(cx, |buffer, cx| {
-            local.language_server_ids_for_buffer(buffer, cx)
-        }) {
-            if let Some(LanguageServerState::Running {
-                workspace_diagnostics_refresh_tasks,
-                ..
-            }) = local.language_servers.get_mut(&server_id)
-            {
-                for diagnostics in workspace_diagnostics_refresh_tasks.values_mut() {
-                    diagnostics.refresh_tx.try_send(()).ok();
-                }
-            }
+        for buffer in buffers_to_pull {
+            self.pull_diagnostics_for_buffer(buffer, cx)
+                .detach_and_log_err(cx);
         }
     }
 
@@ -12646,22 +12661,7 @@ impl LspStore {
 
                         notify_server_capabilities_updated(&server, cx);
 
-                        let buffers_to_pull: Vec<_> = self
-                            .as_local()
-                            .into_iter()
-                            .flat_map(|local| {
-                                self.buffer_store.read(cx).buffers().filter(|buffer| {
-                                    let buffer_id = buffer.read(cx).remote_id();
-                                    local
-                                        .buffers_opened_in_servers
-                                        .get(&buffer_id)
-                                        .is_some_and(|servers| servers.contains(&server_id))
-                                })
-                            })
-                            .collect();
-                        for buffer in buffers_to_pull {
-                            self.pull_diagnostics_for_buffer(buffer, cx).detach();
-                        }
+                        self.pull_document_diagnostics_for_server(server_id, cx);
                     }
                 }
                 "textDocument/documentColor" => {
