@@ -34,8 +34,8 @@ use git_ui::project_diff::ProjectDiffToolbar;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Context, DismissEvent, Element, Entity,
     Focusable, KeyBinding, ParentElement, PathPromptOptions, PromptLevel, ReadGlobal, SharedString,
-    Task, TitlebarOptions, UpdateGlobal, WeakEntity, Window, WindowKind, WindowOptions, actions,
-    image_cache, point, px, retain_all,
+    Task, TitlebarOptions, UpdateGlobal, WeakEntity, Window, WindowHandle, WindowKind,
+    WindowOptions, actions, image_cache, point, px, retain_all,
 };
 use image_viewer::ImageInfo;
 use language::Capability;
@@ -159,11 +159,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
     let flag = cx.wait_for_flag::<PanicFeatureFlag>();
     cx.spawn(async |cx| {
-        if cx
-            .update(|cx| ReleaseChannel::global(cx) == ReleaseChannel::Dev)
-            .unwrap_or_default()
-            || flag.await
-        {
+        if cx.update(|cx| ReleaseChannel::global(cx) == ReleaseChannel::Dev) || flag.await {
             cx.update(|cx| {
                 cx.on_action(|_: &TestPanic, _| panic!("Ran the TestPanic action"))
                     .on_action(|_: &TestCrash, _| {
@@ -174,8 +170,7 @@ pub fn init(cx: &mut App) {
                             puts(0xabad1d3a as *const i8);
                         }
                     });
-            })
-            .ok();
+            });
         };
     })
     .detach();
@@ -433,6 +428,8 @@ pub fn initialize_workspace(
             window,
             cx,
         );
+        let active_buffer_encoding =
+            cx.new(|_| encoding_selector::ActiveBufferEncoding::new(workspace));
         let active_buffer_language =
             cx.new(|_| language_selector::ActiveBufferLanguage::new(workspace));
         let active_toolchain_language =
@@ -459,6 +456,7 @@ pub fn initialize_workspace(
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
+            status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
             status_bar.add_right_item(line_ending_indicator, window, cx);
@@ -646,8 +644,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
                 cx.update(|cx| {
                     cx.open_url("https://zed.dev/docs/linux#could-not-start-inotify");
                     cx.quit();
-                })
-                .ok();
+                });
             }
         })
         .detach()
@@ -677,8 +674,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
                 cx.update(|cx| {
                     cx.open_url("https://zed.dev/docs/windows");
                     cx.quit()
-                })
-                .ok();
+                });
             }
         })
         .detach()
@@ -728,8 +724,7 @@ fn show_software_emulation_warning_if_needed(
                 cx.update(|cx| {
                     cx.open_url(open_url);
                     cx.quit();
-                })
-                .ok();
+                });
             }
         })
         .detach()
@@ -1369,8 +1364,7 @@ fn about(_: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
             let content = format!("{}\n{}", message, detail.as_deref().unwrap_or(""));
             cx.update(|cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(content));
-            })
-            .ok();
+            });
         }
     })
     .detach();
@@ -1394,19 +1388,18 @@ fn quit(_: &Quit, cx: &mut App) {
 
     let should_confirm = WorkspaceSettings::get_global(cx).confirm_quit;
     cx.spawn(async move |cx| {
-        let mut workspace_windows = cx.update(|cx| {
+        let mut workspace_windows: Vec<WindowHandle<Workspace>> = cx.update(|cx| {
             cx.windows()
                 .into_iter()
                 .filter_map(|window| window.downcast::<Workspace>())
                 .collect::<Vec<_>>()
-        })?;
+        });
 
         // If multiple windows have unsaved changes, and need a save prompt,
         // prompt in the active window before switching to a different window.
         cx.update(|cx| {
             workspace_windows.sort_by_key(|window| window.is_active(cx) == Some(false));
-        })
-        .log_err();
+        });
 
         if should_confirm && let Some(workspace) = workspace_windows.first() {
             let answer = workspace
@@ -1438,12 +1431,13 @@ fn quit(_: &Quit, cx: &mut App) {
                     workspace.prepare_to_close(CloseIntent::Quit, window, cx)
                 })
                 .log_err()
-                && !should_close.await?
             {
-                return Ok(());
+                if !should_close.await? {
+                    return Ok(());
+                }
             }
         }
-        cx.update(|cx| cx.quit())?;
+        cx.update(|cx| cx.quit());
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -1652,7 +1646,7 @@ pub fn handle_settings_file_changes(
                 Either::Right(content) => (content, true),
             };
 
-            let result = cx.update_global(|store: &mut SettingsStore, cx| {
+            cx.update_global(|store: &mut SettingsStore, cx| {
                 let result = if is_user {
                     store.set_user_settings(&content, cx)
                 } else {
@@ -1671,10 +1665,6 @@ pub fn handle_settings_file_changes(
                 }
                 cx.refresh_windows();
             });
-
-            if result.is_err() {
-                break; // App dropped
-            }
         }
     })
     .detach();
@@ -1786,8 +1776,7 @@ pub fn handle_keymap_file_changes(
                         show_keymap_file_json_error(notification_id.clone(), &error, cx)
                     }
                 }
-            })
-            .ok();
+            });
         }
     })
     .detach();
@@ -1878,8 +1867,7 @@ fn show_markdown_app_notification<F>(
                     .primary_on_click_arc(primary_button_on_click)
                 })
             })
-        })
-        .ok();
+        });
     })
     .detach();
 }
@@ -2016,9 +2004,9 @@ fn open_local_file(
             let file_exists = {
                 let full_path = worktree.read_with(cx, |tree, _| {
                     tree.abs_path().join(settings_relative_path.as_std_path())
-                })?;
+                });
 
-                let fs = project.read_with(cx, |project, _| project.fs().clone())?;
+                let fs = project.read_with(cx, |project, _| project.fs().clone());
 
                 fs.metadata(&full_path)
                     .await
@@ -2029,23 +2017,23 @@ fn open_local_file(
 
             if !file_exists {
                 if let Some(dir_path) = settings_relative_path.parent()
-                    && worktree.read_with(cx, |tree, _| tree.entry_for_path(dir_path).is_none())?
+                    && worktree.read_with(cx, |tree, _| tree.entry_for_path(dir_path).is_none())
                 {
                     project
                         .update(cx, |project, cx| {
                             project.create_entry((tree_id, dir_path), true, cx)
-                        })?
+                        })
                         .await
                         .context("worktree was removed")?;
                 }
 
                 if worktree.read_with(cx, |tree, _| {
                     tree.entry_for_path(settings_relative_path).is_none()
-                })? {
+                }) {
                     project
                         .update(cx, |project, cx| {
                             project.create_entry((tree_id, settings_relative_path), false, cx)
-                        })?
+                        })
                         .await
                         .context("worktree was removed")?;
                 }
