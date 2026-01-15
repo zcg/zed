@@ -1519,6 +1519,13 @@ impl ChannelClient {
                             })
                             .detach()
                     } else {
+                        if type_name == "UpdateProject" {
+                            log::warn!(
+                                "{}:ignoring remote message without handler. name:{type_name}",
+                                this.name
+                            );
+                            continue;
+                        }
                         log::error!("{}:unhandled remote message name:{type_name}", this.name);
                         if let Err(e) = AnyProtoClient::from(this.clone()).send_response(
                             message_id,

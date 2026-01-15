@@ -323,24 +323,38 @@ impl TrustedWorktreesStore {
                     }
                 }
                 PathTrust::AbsPath(abs_path) => {
-                    debug_assert!(
-                        util::paths::is_absolute(
-                            &abs_path.to_string_lossy(),
-                            worktree_store.read(cx).path_style()
-                        ),
-                        "Cannot trust non-absolute path {abs_path:?}"
-                    );
+                    let path_style = worktree_store.read(cx).path_style();
+                    let abs_path_str = abs_path.to_string_lossy();
+                    let normalized_abs_path = if util::paths::is_absolute(&abs_path_str, path_style)
+                    {
+                        abs_path.clone()
+                    } else if abs_path_str.starts_with("~") {
+                        PathBuf::from(shellexpand::tilde(&abs_path_str).to_string())
+                    } else if abs_path_str.starts_with("/~") {
+                        let trimmed = abs_path_str.trim_start_matches('/');
+                        PathBuf::from(shellexpand::tilde(trimmed).to_string())
+                    } else {
+                        log::warn!("Cannot trust non-absolute path {abs_path:?}");
+                        continue;
+                    };
+                    if !util::paths::is_absolute(
+                        &normalized_abs_path.to_string_lossy(),
+                        path_style,
+                    ) {
+                        log::warn!("Cannot trust non-absolute path {normalized_abs_path:?}");
+                        continue;
+                    }
                     if let Some((worktree_id, is_file)) =
-                        find_worktree_in_store(worktree_store.read(cx), abs_path, cx)
+                        find_worktree_in_store(worktree_store.read(cx), &normalized_abs_path, cx)
                     {
                         if is_file {
                             new_trusted_single_file_worktrees.insert(worktree_id);
                         } else {
                             new_trusted_other_worktrees
-                                .insert((Arc::from(abs_path.as_path()), worktree_id));
+                                .insert((Arc::from(normalized_abs_path.as_path()), worktree_id));
                         }
                     }
-                    new_trusted_abs_paths.insert(abs_path.clone());
+                    new_trusted_abs_paths.insert(normalized_abs_path);
                 }
             }
         }

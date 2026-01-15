@@ -930,14 +930,19 @@ impl DirectoryLister {
         }
         .read(cx);
         let path_style = project.path_style(cx);
-        project
-            .visible_worktrees(cx)
-            .next()
-            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
-            .or_else(|| std::env::home_dir().map(|dir| dir.to_string_lossy().into_owned()))
-            .map(|mut s| {
-                s.push_str(path_style.primary_separator());
-                s
+        if let Some(worktree) = project.visible_worktrees(cx).next() {
+            let mut path = worktree.read(cx).abs_path().to_string_lossy().into_owned();
+            path.push_str(path_style.primary_separator());
+            return path;
+        }
+        if !project.is_local() {
+            return format!("~{}", path_style.primary_separator());
+        }
+        std::env::home_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .map(|mut path| {
+                path.push_str(path_style.primary_separator());
+                path
             })
             .unwrap_or_else(|| {
                 if path_style.is_windows() {
