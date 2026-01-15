@@ -3255,6 +3255,14 @@ impl Workspace {
 
         let other_is_zoomed = self.zoomed.is_some() && self.zoomed_position != Some(dock_side);
         let was_visible = self.is_dock_at_position_open(dock_side, cx) && !other_is_zoomed;
+
+        if let Some(panel) = self.dock_at_position(dock_side).read(cx).active_panel() {
+            telemetry::event!(
+                "Panel Button Clicked",
+                name = panel.persistent_name(),
+                toggle_state = !was_visible
+            );
+        }
         if was_visible {
             self.save_open_dock_positions(cx);
         }
@@ -3415,6 +3423,13 @@ impl Workspace {
             did_focus_panel = !panel.panel_focus_handle(cx).contains_focused(window, cx);
             did_focus_panel
         });
+
+        telemetry::event!(
+            "Panel Button Clicked",
+            name = T::persistent_name(),
+            toggle_state = did_focus_panel
+        );
+
         did_focus_panel
     }
 
@@ -6423,6 +6438,13 @@ impl Workspace {
         self.modal_layer.read(cx).active_modal()
     }
 
+    /// Toggles a modal of type `V`. If a modal of the same type is currently active,
+    /// it will be hidden. If a different modal is active, it will be replaced with the new one.
+    /// If no modal is active, the new modal will be shown.
+    ///
+    /// If closing the current modal fails (e.g., due to `on_before_dismiss` returning
+    /// `DismissDecision::Dismiss(false)` or `DismissDecision::Pending`), the new modal
+    /// will not be shown.
     pub fn toggle_modal<V: ModalView, B>(&mut self, window: &mut Window, cx: &mut App, build: B)
     where
         B: FnOnce(&mut Window, &mut Context<V>) -> V,
