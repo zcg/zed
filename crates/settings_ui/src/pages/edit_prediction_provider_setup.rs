@@ -354,8 +354,8 @@ fn render_github_copilot_provider(
     cx: &mut App,
 ) -> Option<impl IntoElement> {
     let copilot = EditPredictionStore::try_global(cx)?
-        .read(cx)
-        .copilot_for_project(&project);
+        .update(cx, |store, cx| store.start_copilot_for_project(&project, cx));
+    let copilot_for_config = copilot.clone();
     let configuration_view = window.use_state(cx, |_, cx| {
         copilot_ui::ConfigurationView::new(
             move |cx| {
@@ -364,6 +364,7 @@ fn render_github_copilot_provider(
                     .is_some_and(|copilot| copilot.read(cx).is_authenticated())
             },
             copilot_ui::ConfigurationMode::EditPrediction,
+            copilot_for_config.clone(),
             cx,
         )
     });

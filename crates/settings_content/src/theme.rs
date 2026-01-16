@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use settings_macros::{MergeFrom, with_fallible_options};
-use std::{borrow::Cow, fmt::Display, sync::Arc};
+use std::{borrow::Cow, fmt::Display, str::FromStr, sync::Arc};
 
 use crate::serialize_f32_with_two_decimal_places;
 
@@ -1273,6 +1273,27 @@ pub enum FontStyleContent {
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize, MergeFrom)]
 #[serde(transparent)]
 pub struct FontWeightContent(pub f32);
+
+impl From<f32> for FontWeightContent {
+    fn from(value: f32) -> Self {
+        Self(value)
+    }
+}
+
+impl Display for FontWeightContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for FontWeightContent {
+    type Err = std::num::ParseFloatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.parse::<f32>()?;
+        Ok(Self(value))
+    }
+}
 
 impl Default for FontWeightContent {
     fn default() -> Self {

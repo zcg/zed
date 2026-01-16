@@ -15,7 +15,7 @@ use copilot_chat::{
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt};
-use gpui::{AnyView, App, AsyncApp, Entity, Subscription, Task};
+use gpui::{AnyView, App, AsyncApp, Entity, Subscription, Task, Window};
 use http_client::StatusCode;
 use language::language_settings::all_language_settings;
 use language_model::{
@@ -29,6 +29,8 @@ use language_model::{
 use settings::SettingsStore;
 use ui::prelude::*;
 use util::debug_panic;
+use workspace::Workspace;
+use edit_prediction::EditPredictionStore;
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("copilot_chat");
 const PROVIDER_NAME: LanguageModelProviderName =
@@ -175,10 +177,23 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
     fn configuration_view(
         &self,
         _target_agent: language_model::ConfigurationViewTargetAgent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        cx.new(|cx| {
+        let copilot = window
+            .root::<Workspace>()
+            .flatten()
+            .and_then(|workspace| {
+                let (project, app_state) = {
+                    let workspace = workspace.read(cx);
+                    (workspace.project().clone(), workspace.app_state().clone())
+                };
+                let ep_store =
+                    EditPredictionStore::global(&app_state.client, &app_state.user_store, cx);
+                ep_store.update(cx, |store, cx| store.start_copilot_for_project(&project, cx))
+            });
+
+        cx.new(move |cx| {
             copilot_ui::ConfigurationView::new(
                 |cx| {
                     CopilotChat::global(cx)
@@ -186,6 +201,7 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
                         .unwrap_or(false)
                 },
                 copilot_ui::ConfigurationMode::Chat,
+                copilot,
                 cx,
             )
         })

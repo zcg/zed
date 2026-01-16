@@ -16,12 +16,23 @@ const ERROR_LABEL: &str =
 struct CopilotStatusToast;
 
 pub fn initiate_sign_in(window: &mut Window, cx: &mut App) {
-    let is_reinstall = false;
-    initiate_sign_in_impl(is_reinstall, window, cx)
+    initiate_sign_in_with(None, window, cx)
+}
+
+pub fn initiate_sign_in_for(copilot: Entity<Copilot>, window: &mut Window, cx: &mut App) {
+    initiate_sign_in_with(Some(copilot), window, cx)
 }
 
 pub fn initiate_sign_out(window: &mut Window, cx: &mut App) {
-    let Some(copilot) = Copilot::global(cx) else {
+    initiate_sign_out_with(None, window, cx)
+}
+
+pub fn initiate_sign_out_for(copilot: Entity<Copilot>, window: &mut Window, cx: &mut App) {
+    initiate_sign_out_with(Some(copilot), window, cx)
+}
+
+fn initiate_sign_out_with(copilot: Option<Entity<Copilot>>, window: &mut Window, cx: &mut App) {
+    let Some(copilot) = resolve_copilot(copilot, cx) else {
         return;
     };
 
@@ -47,12 +58,25 @@ pub fn initiate_sign_out(window: &mut Window, cx: &mut App) {
 }
 
 pub fn reinstall_and_sign_in(window: &mut Window, cx: &mut App) {
-    let Some(copilot) = Copilot::global(cx) else {
+    reinstall_and_sign_in_with(None, window, cx)
+}
+
+pub fn reinstall_and_sign_in_for(copilot: Entity<Copilot>, window: &mut Window, cx: &mut App) {
+    reinstall_and_sign_in_with(Some(copilot), window, cx)
+}
+
+fn reinstall_and_sign_in_with(copilot: Option<Entity<Copilot>>, window: &mut Window, cx: &mut App) {
+    let Some(copilot) = resolve_copilot(copilot, cx) else {
         return;
     };
     let _ = copilot.update(cx, |copilot, cx| copilot.reinstall(cx));
     let is_reinstall = true;
-    initiate_sign_in_impl(is_reinstall, window, cx);
+    initiate_sign_in_impl(Some(copilot), is_reinstall, window, cx);
+}
+
+fn initiate_sign_in_with(copilot: Option<Entity<Copilot>>, window: &mut Window, cx: &mut App) {
+    let is_reinstall = false;
+    initiate_sign_in_impl(copilot, is_reinstall, window, cx)
 }
 
 fn open_copilot_code_verification_window(copilot: &Entity<Copilot>, window: &Window, cx: &mut App) {
@@ -96,8 +120,13 @@ fn copilot_toast(message: Option<&'static str>, window: &Window, cx: &mut App) {
     })
 }
 
-pub fn initiate_sign_in_impl(is_reinstall: bool, window: &mut Window, cx: &mut App) {
-    let Some(copilot) = Copilot::global(cx) else {
+pub fn initiate_sign_in_impl(
+    copilot: Option<Entity<Copilot>>,
+    is_reinstall: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(copilot) = resolve_copilot(copilot, cx) else {
         return;
     };
     if matches!(copilot.read(cx).status(), Status::Disabled) {
@@ -115,11 +144,12 @@ pub fn initiate_sign_in_impl(is_reinstall: bool, window: &mut Window, cx: &mut A
                 cx,
             );
 
+            let copilot_for_update = Some(copilot.clone());
             window
                 .spawn(cx, async move |cx| {
                     task.await;
                     cx.update(|window, cx| {
-                        let Some(copilot) = Copilot::global(cx) else {
+                        let Some(copilot) = resolve_copilot(copilot_for_update.clone(), cx) else {
                             return;
                         };
                         match copilot.read(cx).status() {
@@ -274,47 +304,45 @@ impl CopilotCodeVerification {
                             .on_click({
                                 let command = data.command.clone();
                                 cx.listener(move |this, _, _window, cx| {
-                                    if let Some(copilot) = Copilot::global(cx) {
-                                        let command = command.clone();
-                                        let copilot_clone = copilot.clone();
-                                        copilot.update(cx, |copilot, cx| {
-                                            if let Some(server) = copilot.language_server() {
-                                                let server = server.clone();
-                                                cx.spawn(async move |_, cx| {
-                                                    let result = server
-                                                        .request::<lsp::request::ExecuteCommand>(
-                                                            lsp::ExecuteCommandParams {
-                                                                command: command.command.clone(),
-                                                                arguments: command
-                                                                    .arguments
-                                                                    .clone()
-                                                                    .unwrap_or_default(),
-                                                                ..Default::default()
-                                                            },
-                                                        )
-                                                        .await
-                                                        .into_response()
-                                                        .ok()
-                                                        .flatten();
-                                                    if let Some(value) = result {
-                                                        if let Ok(status) =
-                                                            serde_json::from_value::<
-                                                                request::SignInStatus,
-                                                            >(value)
-                                                        {
-                                                            copilot_clone
-                                                                .update(cx, |copilot, cx| {
-                                                                    copilot.update_sign_in_status(
-                                                                        status, cx,
-                                                                    );
-                                                                });
-                                                        }
+                                    let copilot = this.copilot.clone();
+                                    let command = command.clone();
+                                    let copilot_clone = copilot.clone();
+                                    copilot.update(cx, |copilot, cx| {
+                                        if let Some(server) = copilot.language_server() {
+                                            let server = server.clone();
+                                            cx.spawn(async move |_, cx| {
+                                                let result = server
+                                                    .request::<lsp::request::ExecuteCommand>(
+                                                        lsp::ExecuteCommandParams {
+                                                            command: command.command.clone(),
+                                                            arguments: command
+                                                                .arguments
+                                                                .clone()
+                                                                .unwrap_or_default(),
+                                                            ..Default::default()
+                                                        },
+                                                    )
+                                                    .await
+                                                    .into_response()
+                                                    .ok()
+                                                    .flatten();
+                                                if let Some(value) = result {
+                                                    if let Ok(status) =
+                                                        serde_json::from_value::<
+                                                            request::SignInStatus,
+                                                        >(value)
+                                                    {
+                                                        copilot_clone.update(cx, |copilot, cx| {
+                                                            copilot.update_sign_in_status(
+                                                                status, cx,
+                                                            );
+                                                        });
                                                     }
-                                                })
-                                                .detach();
-                                            }
-                                        });
-                                    }
+                                                }
+                                            })
+                                            .detach();
+                                        }
+                                    });
                                     this.connect_clicked = true;
                                 })
                             }),
@@ -459,6 +487,7 @@ impl Render for CopilotCodeVerification {
 
 pub struct ConfigurationView {
     copilot_status: Option<Status>,
+    copilot: Option<Entity<Copilot>>,
     is_authenticated: Box<dyn Fn(&App) -> bool + 'static>,
     edit_prediction: bool,
     _subscription: Option<Subscription>,
@@ -473,12 +502,14 @@ impl ConfigurationView {
     pub fn new(
         is_authenticated: impl Fn(&App) -> bool + 'static,
         mode: ConfigurationMode,
+        copilot: Option<Entity<Copilot>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let copilot = Copilot::global(cx);
+        let copilot = resolve_copilot(copilot, cx);
 
         Self {
             copilot_status: copilot.as_ref().map(|copilot| copilot.read(cx).status()),
+            copilot: copilot.clone(),
             is_authenticated: Box::new(is_authenticated),
             edit_prediction: matches!(mode, ConfigurationMode::EditPrediction),
             _subscription: copilot.as_ref().map(|copilot| {
@@ -568,7 +599,16 @@ impl ConfigurationView {
             .icon_color(Color::Muted)
             .icon_position(IconPosition::Start)
             .icon_size(IconSize::Small)
-            .on_click(|_, window, cx| initiate_sign_in(window, cx))
+            .on_click({
+                let copilot = self.copilot.clone();
+                move |_, window, cx| {
+                    if let Some(copilot) = copilot.clone() {
+                        initiate_sign_in_for(copilot, window, cx);
+                    } else {
+                        initiate_sign_in(window, cx);
+                    }
+                }
+            })
     }
 
     fn render_reinstall_button(&self, edit_prediction: bool) -> impl IntoElement {
@@ -591,7 +631,16 @@ impl ConfigurationView {
             .icon_color(Color::Muted)
             .icon_position(IconPosition::Start)
             .icon_size(IconSize::Small)
-            .on_click(|_, window, cx| reinstall_and_sign_in(window, cx))
+            .on_click({
+                let copilot = self.copilot.clone();
+                move |_, window, cx| {
+                    if let Some(copilot) = copilot.clone() {
+                        reinstall_and_sign_in_for(copilot, window, cx);
+                    } else {
+                        reinstall_and_sign_in(window, cx);
+                    }
+                }
+            })
     }
 
     fn render_for_edit_prediction(&self) -> impl IntoElement {
@@ -683,8 +732,15 @@ impl Render for ConfigurationView {
         if is_authenticated(cx) {
             return ConfiguredApiCard::new("Authorized")
                 .button_label("Sign Out")
-                .on_click(|_, window, cx| {
-                    initiate_sign_out(window, cx);
+                .on_click({
+                    let copilot = self.copilot.clone();
+                    move |_, window, cx| {
+                        if let Some(copilot) = copilot.clone() {
+                            initiate_sign_out_for(copilot, window, cx);
+                        } else {
+                            initiate_sign_out(window, cx);
+                        }
+                    }
                 })
                 .into_any_element();
         }
@@ -695,4 +751,11 @@ impl Render for ConfigurationView {
             self.render_for_chat().into_any_element()
         }
     }
+}
+
+fn resolve_copilot(
+    copilot: Option<Entity<Copilot>>,
+    cx: &App,
+) -> Option<Entity<Copilot>> {
+    copilot.or_else(|| Copilot::global(cx))
 }
