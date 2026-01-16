@@ -3643,7 +3643,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
         );
     }
 
-    // Test 3: Confirm rule forces confirmation even with always_allow_tool_actions=true
+    // Test 3: always_allow_tool_actions=true overrides always_confirm patterns
     {
         let handle = Rc::new(cx.update(|cx| FakeTerminalHandle::new_with_immediate_exit(cx, 0)));
         let environment = Rc::new(FakeThreadEnvironment {
@@ -3670,9 +3670,9 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let tool = Arc::new(crate::TerminalTool::new(project.clone(), environment));
-        let (event_stream, mut rx) = crate::ToolCallEventStream::test();
+        let (event_stream, _rx) = crate::ToolCallEventStream::test();
 
-        let _task = cx.update(|cx| {
+        let task = cx.update(|cx| {
             tool.run(
                 crate::TerminalToolInput {
                     command: "sudo rm file".to_string(),
@@ -3684,16 +3684,14 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
             )
         });
 
-        let auth = rx.expect_authorization().await;
-        assert!(
-            auth.tool_call.fields.title.is_some(),
-            "expected authorization request for sudo command despite always_allow_tool_actions=true"
-        );
+        // With always_allow_tool_actions=true, confirm patterns are overridden
+        task.await
+            .expect("command should be allowed with always_allow_tool_actions=true");
     }
 
-    // Test 4: default_mode: Deny blocks commands when no pattern matches
+    // Test 4: always_allow_tool_actions=true overrides default_mode: Deny
     {
-        let handle = Rc::new(cx.update(|cx| FakeTerminalHandle::new_never_exits(cx)));
+        let handle = Rc::new(cx.update(|cx| FakeTerminalHandle::new_with_immediate_exit(cx, 0)));
         let environment = Rc::new(FakeThreadEnvironment {
             handle: handle.clone(),
         });
@@ -3730,15 +3728,9 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
             )
         });
 
-        let result = task.await;
-        assert!(
-            result.is_err(),
-            "expected command to be blocked by default_mode: Deny"
-        );
-        assert!(
-            result.unwrap_err().to_string().contains("disabled"),
-            "error should mention the tool is disabled"
-        );
+        // With always_allow_tool_actions=true, even default_mode: Deny is overridden
+        task.await
+            .expect("command should be allowed with always_allow_tool_actions=true");
     }
 }
 
@@ -5561,4 +5553,96 @@ async fn test_fetch_tool_allow_rule_skips_confirmation(cx: &mut TestAppContext) 
         !matches!(event, Ok(Some(Ok(ThreadEvent::ToolCallAuthorization(_))))),
         "expected no authorization request for allowed docs.rs URL"
     );
+}
+
+#[gpui::test]
+async fn test_queued_message_ends_turn_at_boundary(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    // Add a tool so we can simulate tool calls
+    thread.update(cx, |thread, _cx| {
+        thread.add_tool(EchoTool);
+    });
+
+    // Start a turn by sending a message
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Simulate the model making a tool call
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        LanguageModelToolUse {
+            id: "tool_1".into(),
+            name: "echo".into(),
+            raw_input: r#"{"text": "hello"}"#.into(),
+            input: json!({"text": "hello"}),
+            is_input_complete: true,
+            thought_signature: None,
+        },
+    ));
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::ToolUse));
+
+    // Queue a message before ending the stream
+    thread.update(cx, |thread, _cx| {
+        thread.queue_message(
+            vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "This is my queued message".to_string(),
+            ))],
+            vec![],
+        );
+    });
+
+    // Now end the stream - tool will run, and the boundary check should see the queue
+    fake_model.end_last_completion_stream();
+
+    // Collect all events until the turn stops
+    let all_events = collect_events_until_stop(&mut events, cx).await;
+
+    // Verify we received the tool call event
+    let tool_call_ids: Vec<_> = all_events
+        .iter()
+        .filter_map(|e| match e {
+            Ok(ThreadEvent::ToolCall(tc)) => Some(tc.tool_call_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_call_ids,
+        vec!["tool_1"],
+        "Should have received a tool call event for our echo tool"
+    );
+
+    // The turn should have stopped with EndTurn
+    let stop_reasons = stop_events(all_events);
+    assert_eq!(
+        stop_reasons,
+        vec![acp::StopReason::EndTurn],
+        "Turn should have ended after tool completion due to queued message"
+    );
+
+    // Verify the queued message is still there
+    thread.update(cx, |thread, _cx| {
+        let queued = thread.queued_messages();
+        assert_eq!(queued.len(), 1, "Should still have one queued message");
+        assert!(matches!(
+            &queued[0].content[0],
+            acp::ContentBlock::Text(t) if t.text == "This is my queued message"
+        ));
+    });
+
+    // Thread should be idle now
+    thread.update(cx, |thread, _cx| {
+        assert!(
+            thread.is_turn_complete(),
+            "Thread should not be running after turn ends"
+        );
+    });
 }
