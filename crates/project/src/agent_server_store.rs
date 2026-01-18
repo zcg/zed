@@ -146,6 +146,33 @@ pub struct AgentServersUpdated;
 
 impl EventEmitter<AgentServersUpdated> for AgentServerStore {}
 
+fn fallback_agent_server_command(root_dir: Option<String>) -> proto::AgentServerCommand {
+    let message = "Agent server failed to start. See logs for details.";
+    #[cfg(windows)]
+    let (path, args) = (
+        "cmd.exe".to_string(),
+        vec![
+            "/C".to_string(),
+            format!("echo {} 1>&2 & exit /b 1", message),
+        ],
+    );
+    #[cfg(not(windows))]
+    let (path, args) = (
+        "/bin/sh".to_string(),
+        vec![
+            "-lc".to_string(),
+            format!("echo \"{}\" 1>&2; exit 1", message),
+        ],
+    );
+    proto::AgentServerCommand {
+        path,
+        args,
+        env: std::collections::HashMap::new(),
+        root_dir: root_dir.unwrap_or_default(),
+        login: None,
+    }
+}
+
 #[cfg(test)]
 mod ext_agent_tests {
     use super::*;
@@ -861,72 +888,88 @@ impl AgentServerStore {
         envelope: TypedEnvelope<proto::GetAgentServerCommand>,
         mut cx: AsyncApp,
     ) -> Result<proto::AgentServerCommand> {
-        let (command, root_dir, login_command) = this
-            .update(&mut cx, |this, cx| {
-                let AgentServerStoreState::Local {
-                    downstream_client, ..
-                } = &this.state
-                else {
-                    debug_panic!("should not receive GetAgentServerCommand in a non-local project");
-                    bail!("unexpected GetAgentServerCommand request in a non-local project");
-                };
-                let agent = this
-                    .external_agents
-                    .get_mut(&*envelope.payload.name)
-                    .with_context(|| format!("agent `{}` not found", envelope.payload.name))?;
-                let (status_tx, new_version_available_tx) = downstream_client
-                    .clone()
-                    .map(|(project_id, downstream_client)| {
-                        let (status_tx, mut status_rx) = watch::channel(SharedString::from(""));
-                        let (new_version_available_tx, mut new_version_available_rx) =
-                            watch::channel(None);
-                        cx.spawn({
-                            let downstream_client = downstream_client.clone();
-                            let name = envelope.payload.name.clone();
-                            async move |_, _| {
-                                while let Some(status) = status_rx.recv().await.ok() {
-                                    downstream_client.send(
-                                        proto::ExternalAgentLoadingStatusUpdated {
-                                            project_id,
-                                            name: name.clone(),
-                                            status: status.to_string(),
-                                        },
-                                    )?;
-                                }
-                                anyhow::Ok(())
+        let task = match this.update(&mut cx, |this, cx| {
+            let AgentServerStoreState::Local {
+                downstream_client, ..
+            } = &this.state
+            else {
+                debug_panic!("should not receive GetAgentServerCommand in a non-local project");
+                bail!("unexpected GetAgentServerCommand request in a non-local project");
+            };
+            let agent = this
+                .external_agents
+                .get_mut(&*envelope.payload.name)
+                .with_context(|| format!("agent `{}` not found", envelope.payload.name))?;
+            let (status_tx, new_version_available_tx) = downstream_client
+                .clone()
+                .map(|(project_id, downstream_client)| {
+                    let (status_tx, mut status_rx) = watch::channel(SharedString::from(""));
+                    let (new_version_available_tx, mut new_version_available_rx) =
+                        watch::channel(None);
+                    cx.spawn({
+                        let downstream_client = downstream_client.clone();
+                        let name = envelope.payload.name.clone();
+                        async move |_, _| {
+                            while let Some(status) = status_rx.recv().await.ok() {
+                                downstream_client.send(
+                                    proto::ExternalAgentLoadingStatusUpdated {
+                                        project_id,
+                                        name: name.clone(),
+                                        status: status.to_string(),
+                                    },
+                                )?;
                             }
-                        })
-                        .detach_and_log_err(cx);
-                        cx.spawn({
-                            let name = envelope.payload.name.clone();
-                            async move |_, _| {
-                                if let Some(version) =
-                                    new_version_available_rx.recv().await.ok().flatten()
-                                {
-                                    downstream_client.send(
-                                        proto::NewExternalAgentVersionAvailable {
-                                            project_id,
-                                            name: name.clone(),
-                                            version,
-                                        },
-                                    )?;
-                                }
-                                anyhow::Ok(())
-                            }
-                        })
-                        .detach_and_log_err(cx);
-                        (status_tx, new_version_available_tx)
+                            anyhow::Ok(())
+                        }
                     })
-                    .unzip();
-                anyhow::Ok(agent.get_command(
-                    envelope.payload.root_dir.as_deref(),
-                    HashMap::default(),
-                    status_tx,
-                    new_version_available_tx,
-                    &mut cx.to_async(),
-                ))
-            })?
-            .await?;
+                    .detach_and_log_err(cx);
+                    cx.spawn({
+                        let name = envelope.payload.name.clone();
+                        async move |_, _| {
+                            if let Some(version) =
+                                new_version_available_rx.recv().await.ok().flatten()
+                            {
+                                downstream_client.send(
+                                    proto::NewExternalAgentVersionAvailable {
+                                        project_id,
+                                        name: name.clone(),
+                                        version,
+                                    },
+                                )?;
+                            }
+                            anyhow::Ok(())
+                        }
+                    })
+                    .detach_and_log_err(cx);
+                    (status_tx, new_version_available_tx)
+                })
+                .unzip();
+            anyhow::Ok(agent.get_command(
+                envelope.payload.root_dir.as_deref(),
+                HashMap::default(),
+                status_tx,
+                new_version_available_tx,
+                &mut cx.to_async(),
+            ))
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                log::error!("Failed to prepare agent server command: {error:#}");
+                return Ok(fallback_agent_server_command(
+                    envelope.payload.root_dir.clone(),
+                ));
+            }
+        };
+
+        let (command, root_dir, login_command) = match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!("Failed to get agent server command: {error:#}");
+                return Ok(fallback_agent_server_command(
+                    envelope.payload.root_dir.clone(),
+                ));
+            }
+        };
         Ok(proto::AgentServerCommand {
             path: command.path.to_string_lossy().into_owned(),
             args: command.args,
@@ -1276,9 +1319,20 @@ async fn download_latest_version(
         .await?
         .context("expected package to be installed")?;
 
+    let target_dir = dir.join(version.to_string());
+    _ = fs
+        .remove_dir(
+            &target_dir,
+            RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: true,
+            },
+        )
+        .await;
+
     fs.rename(
         &tmp_dir.keep(),
-        &dir.join(version.to_string()),
+        &target_dir,
         RenameOptions {
             ignore_if_exists: true,
             overwrite: true,

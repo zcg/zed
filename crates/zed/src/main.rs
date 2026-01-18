@@ -184,7 +184,6 @@ fn main() {
     let args = Args::parse();
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
-    #[cfg(not(target_os = "windows"))]
     if let Some(socket) = &args.askpass {
         askpass::main(socket);
         return;
@@ -236,7 +235,11 @@ fn main() {
     match util::get_zed_cli_path() {
         Ok(path) => askpass::set_askpass_program(path),
         Err(err) => {
-            eprintln!("Error: {}", err);
+            eprintln!(
+                "Warning: zed-cli not found ({}). Falling back to zed.exe for askpass. \
+To build it, run: cargo build -p cli",
+                err
+            );
             if std::option_env!("ZED_BUNDLE").is_some() {
                 process::exit(1);
             }
@@ -1510,9 +1513,7 @@ struct Args {
 
     /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
     /// by having Zed act like netcat communicating over a Unix socket.
-    #[arg(long)]
-    #[cfg(not(target_os = "windows"))]
-    #[arg(hide = true)]
+    #[arg(long, hide = true)]
     askpass: Option<String>,
 
     #[arg(long, hide = true)]

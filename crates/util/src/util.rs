@@ -22,7 +22,7 @@ use futures::Future;
 use itertools::Either;
 use paths::PathExt;
 use regex::Regex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
 use std::{
     borrow::Cow,
@@ -337,8 +337,8 @@ pub fn get_zed_cli_path() -> Result<PathBuf> {
         // so here ./cli is for both installed and development builds.
         &["./cli"]
     } else if cfg!(target_os = "windows") {
-        // bin/zed.exe is for installed builds, ./cli.exe is for development builds.
-        &["bin/zed.exe", "./cli.exe"]
+        // ./cli.exe is for development builds, bin/zed.exe is for installed builds.
+        &["./cli.exe", "bin/zed.exe"]
     } else if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") {
         // bin is the standard, ./cli is for the target directory in development builds.
         &["../bin/zed", "./cli"]
@@ -346,21 +346,61 @@ pub fn get_zed_cli_path() -> Result<PathBuf> {
         anyhow::bail!("unsupported platform for determining zed-cli path");
     };
 
-    possible_locations
-        .iter()
-        .find_map(|p| {
-            parent
-                .join(p)
-                .canonicalize()
-                .ok()
-                .filter(|p| p != &zed_path)
-        })
-        .with_context(|| {
-            format!(
-                "could not find zed-cli from any of: {}",
-                possible_locations.join(", ")
-            )
-        })
+    if let Some(path) = possible_locations.iter().find_map(|p| {
+        parent
+            .join(p)
+            .canonicalize()
+            .ok()
+            .filter(|p| p != &zed_path)
+    }) {
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(root) = parent.parent().and_then(|p| p.parent()) {
+            if try_build_cli(root, !cfg!(debug_assertions)).is_ok() {
+                if let Some(path) = possible_locations.iter().find_map(|p| {
+                    parent
+                        .join(p)
+                        .canonicalize()
+                        .ok()
+                        .filter(|p| p != &zed_path)
+                }) {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not find zed-cli from any of: {}",
+        possible_locations.join(", ")
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn try_build_cli(root: &Path, release: bool) -> Result<()> {
+    use std::process::Command;
+
+    let mut command = Command::new("cargo");
+    command.arg("build").arg("-p").arg("cli");
+    if release {
+        command.arg("--release");
+        eprintln!("zed-cli missing; attempting to build with `cargo build -p cli --release`...");
+    } else {
+        eprintln!("zed-cli missing; attempting to build with `cargo build -p cli`...");
+    }
+    let status = command
+        .current_dir(root)
+        .status()
+        .context("spawning cargo to build cli")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("cargo build -p cli failed with status {status}");
+    }
 }
 
 #[cfg(unix)]

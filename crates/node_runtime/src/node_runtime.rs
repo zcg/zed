@@ -373,9 +373,39 @@ impl ManagedNodeRuntime {
     const NODE_PATH: &str = "node.exe";
 
     #[cfg(not(windows))]
-    const NPM_PATH: &str = "bin/npm";
+    const NPM_CANDIDATES: [&str; 2] = ["bin/npm", "lib/node_modules/npm/bin/npm-cli.js"];
     #[cfg(windows)]
-    const NPM_PATH: &str = "node_modules/npm/bin/npm-cli.js";
+    const NPM_CANDIDATES: [&str; 1] = ["node_modules/npm/bin/npm-cli.js"];
+
+    async fn has_musl_loader(arch: &str) -> bool {
+        let candidates: &[&str] = match arch {
+            "x64" => &["ld-musl-x86_64.so.1"],
+            "arm64" => &["ld-musl-aarch64.so.1"],
+            _ => &[],
+        };
+        for candidate in candidates {
+            if smol::fs::metadata(Path::new("/lib").join(candidate))
+                .await
+                .is_ok()
+                || smol::fs::metadata(Path::new("/lib64").join(candidate))
+                    .await
+                    .is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn resolve_npm_path(installation_path: &Path) -> Result<PathBuf> {
+        for candidate in Self::NPM_CANDIDATES {
+            let path = installation_path.join(candidate);
+            if smol::fs::metadata(&path).await.is_ok() {
+                return Ok(path);
+            }
+        }
+        bail!("missing npm file");
+    }
 
     async fn install_if_needed(http: &Arc<dyn HttpClient>) -> Result<Self> {
         log::info!("Node runtime install_if_needed");
@@ -394,39 +424,56 @@ impl ManagedNodeRuntime {
         };
 
         let version = Self::VERSION;
-        let folder_name = format!("node-{version}-{os}-{arch}");
+        let musl_suffix = if os == "linux" && Self::has_musl_loader(arch).await {
+            "-musl"
+        } else {
+            ""
+        };
+        let folder_name = format!("node-{version}-{os}-{arch}{musl_suffix}");
         let node_containing_dir = paths::data_dir().join("node");
         let node_dir = node_containing_dir.join(folder_name);
         let node_binary = node_dir.join(Self::NODE_PATH);
-        let npm_file = node_dir.join(Self::NPM_PATH);
         let node_ca_certs = env::var(NODE_CA_CERTS_ENV_VAR).unwrap_or_else(|_| String::new());
 
         let valid = if fs::metadata(&node_binary).await.is_ok() {
-            let result = util::command::new_smol_command(&node_binary)
-                .env(NODE_CA_CERTS_ENV_VAR, node_ca_certs)
-                .arg(npm_file)
-                .arg("--version")
-                .args(["--cache".into(), node_dir.join("cache")])
-                .args(["--userconfig".into(), node_dir.join("blank_user_npmrc")])
-                .args(["--globalconfig".into(), node_dir.join("blank_global_npmrc")])
-                .output()
-                .await;
-            match result {
-                Ok(output) => {
-                    if output.status.success() {
-                        true
-                    } else {
-                        log::warn!(
-                            "Zed managed Node.js binary at {} failed check with output: {:?}",
-                            node_binary.display(),
-                            output
-                        );
-                        false
+            match Self::resolve_npm_path(&node_dir).await {
+                Ok(npm_file) => {
+                    let result = util::command::new_smol_command(&node_binary)
+                        .env(NODE_CA_CERTS_ENV_VAR, node_ca_certs)
+                        .arg(npm_file)
+                        .arg("--version")
+                        .args(["--cache".into(), node_dir.join("cache")])
+                        .args(["--userconfig".into(), node_dir.join("blank_user_npmrc")])
+                        .args(["--globalconfig".into(), node_dir.join("blank_global_npmrc")])
+                        .output()
+                        .await;
+                    match result {
+                        Ok(output) => {
+                            if output.status.success() {
+                                true
+                            } else {
+                                log::warn!(
+                                    "Zed managed Node.js binary at {} failed check with output: {:?}",
+                                    node_binary.display(),
+                                    output
+                                );
+                                false
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Zed managed Node.js binary at {} failed check, so re-downloading it. \
+                                Error: {}",
+                                node_binary.display(),
+                                err
+                            );
+                            false
+                        }
                     }
                 }
                 Err(err) => {
                     log::warn!(
-                        "Zed managed Node.js binary at {} failed check, so re-downloading it. \
+                        "Zed managed Node.js binary at {} missing npm, so re-downloading it. \
                         Error: {}",
                         node_binary.display(),
                         err
@@ -452,7 +499,7 @@ impl ManagedNodeRuntime {
 
             let version = Self::VERSION;
             let file_name = format!(
-                "node-{version}-{os}-{arch}.{extension}",
+                "node-{version}-{os}-{arch}{musl_suffix}.{extension}",
                 extension = match archive_type {
                     ArchiveType::TarGz => "tar.gz",
                     ArchiveType::Zip => "zip",
@@ -530,16 +577,12 @@ impl NodeRuntimeTrait for ManagedNodeRuntime {
     ) -> Result<Output> {
         let attempt = || async move {
             let node_binary = self.installation_path.join(Self::NODE_PATH);
-            let npm_file = self.installation_path.join(Self::NPM_PATH);
+            let npm_file = Self::resolve_npm_path(&self.installation_path).await?;
             let env_path = path_with_node_binary_prepended(&node_binary).unwrap_or_default();
 
             anyhow::ensure!(
                 smol::fs::metadata(&node_binary).await.is_ok(),
                 "missing node binary file"
-            );
-            anyhow::ensure!(
-                smol::fs::metadata(&npm_file).await.is_ok(),
-                "missing npm file"
             );
 
             let node_ca_certs = env::var(NODE_CA_CERTS_ENV_VAR).unwrap_or_else(|_| String::new());

@@ -12,7 +12,7 @@ pub use remote_client::{
     RemotePlatform, connect,
 };
 pub use transport::docker::DockerConnectionOptions;
-pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption};
+pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption, parse_port_forward_spec};
 pub use transport::wsl::WslConnectionOptions;
 
 #[cfg(any(test, feature = "test-support"))]

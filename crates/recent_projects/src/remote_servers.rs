@@ -3,7 +3,7 @@ use crate::{
         Connection, RemoteConnectionModal, RemoteConnectionPrompt, RemoteSettings, SshConnection,
         SshConnectionHeader, connect, determine_paths_with_positions, open_remote_project,
     },
-    ssh_config::parse_ssh_config_hosts,
+    ssh_config::{SshConfigEntry, parse_ssh_config_entries, parse_ssh_config_hosts},
 };
 use dev_container::start_dev_container;
 use editor::Editor;
@@ -13,6 +13,7 @@ use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, PromptLevel, ScrollHandle, Subscription, Task, WeakEntity, Window,
     canvas,
+    FutureExt as _,
 };
 use language::Point;
 use log::info;
@@ -21,26 +22,29 @@ use picker::Picker;
 use project::{Fs, Project};
 use remote::{
     RemoteClient, RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
-    remote_client::ConnectionIdentifier,
+    parse_port_forward_spec, remote_client::ConnectionIdentifier,
 };
 use settings::{
-    RemoteProject, RemoteSettingsContent, Settings as _, SettingsStore, update_settings_file,
-    watch_config_file,
+    RemoteProject, RemoteSettingsContent, Settings as _, SettingsStore, SshPortForwardOption,
+    update_settings_file, watch_config_file,
 };
 use smol::stream::StreamExt as _;
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
         atomic::{self, AtomicUsize},
     },
+    time::Duration,
 };
 use ui::{
-    CommonAnimationExt, IconButtonShape, KeyBinding, List, ListItem, ListSeparator, Modal,
-    ModalHeader, Navigable, NavigableEntry, Section, Tooltip, WithScrollbar, prelude::*,
+    CommonAnimationExt, ContextMenu, IconButtonShape, KeyBinding, List,
+    ListItem, ListSeparator, Modal, ModalHeader, Navigable, NavigableEntry, PopoverMenu, Section,
+    ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar,
+    prelude::*,
 };
 use util::{
     ResultExt,
@@ -60,29 +64,188 @@ pub struct RemoteServerProjects {
     retained_connections: Vec<Entity<RemoteClient>>,
     ssh_config_updates: Task<()>,
     ssh_config_servers: BTreeSet<SharedString>,
+    ssh_config_entries: HashMap<String, SshConfigEntry>,
     create_new_window: bool,
     _subscription: Subscription,
 }
 
+const START_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
+const START_PROXY_TIMEOUT_WITH_BUILD: Duration = Duration::from_secs(6 * 60);
+const SAVED_CONNECTIONS_LIMIT: usize = 8;
+
 struct CreateRemoteServer {
+    input_mode: CreateRemoteServerInputMode,
     address_editor: Entity<Editor>,
+    form: CreateRemoteServerForm,
+    show_advanced: bool,
+    show_saved_connections: bool,
+    form_errors: CreateRemoteServerFormErrors,
+    password_visible: bool,
+    password_keychain_status: PasswordKeychainStatus,
+    password_keychain_url: Option<String>,
+    password_autoload_url: Option<String>,
     address_error: Option<SharedString>,
     ssh_prompt: Option<Entity<RemoteConnectionPrompt>>,
     _creating: Option<Task<Option<()>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateRemoteServerInputMode {
+    Form,
+    Command,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasswordKeychainStatus {
+    Unknown,
+    Loading,
+    Saved,
+    NotSaved,
+    Error,
+}
+
+#[derive(Clone)]
+struct CreateRemoteServerForm {
+    host_editor: Entity<Editor>,
+    username_editor: Entity<Editor>,
+    port_editor: Entity<Editor>,
+    password_editor: Entity<Editor>,
+    identity_file_editor: Entity<Editor>,
+    jump_host_editor: Entity<Editor>,
+    port_forwards_editor: Entity<Editor>,
+}
+
+#[derive(Clone, Default)]
+struct CreateRemoteServerFormErrors {
+    host: Option<SharedString>,
+    port: Option<SharedString>,
+    port_forwards: Vec<SharedString>,
+}
+
+impl CreateRemoteServerFormErrors {
+    fn is_empty(&self) -> bool {
+        self.host.is_none() && self.port.is_none() && self.port_forwards.is_empty()
+    }
+}
+
 impl CreateRemoteServer {
     fn new(window: &mut Window, cx: &mut App) -> Self {
         let address_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let host_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let username_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let port_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let password_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let identity_file_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let jump_host_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let port_forwards_editor = cx.new(|cx| Editor::single_line(window, cx));
+
         address_editor.update(cx, |this, cx| {
             this.focus_handle(cx).focus(window, cx);
         });
+
+        host_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("example.com", window, cx);
+        });
+        username_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("user", window, cx);
+        });
+        port_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("22", window, cx);
+        });
+        password_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("password", window, cx);
+            this.set_masked(true, cx);
+        });
+        identity_file_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("~/.ssh/id_ed25519", window, cx);
+        });
+        jump_host_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("bastion.example.com", window, cx);
+        });
+        port_forwards_editor.update(cx, |this, cx| {
+            this.set_placeholder_text("8080:localhost:80", window, cx);
+        });
+
+        host_editor.focus_handle(cx).focus(window, cx);
         Self {
+            input_mode: CreateRemoteServerInputMode::Form,
             address_editor,
+            form: CreateRemoteServerForm {
+                host_editor,
+                username_editor,
+                port_editor,
+                password_editor,
+                identity_file_editor,
+                jump_host_editor,
+                port_forwards_editor,
+            },
+            show_advanced: false,
+            show_saved_connections: true,
+            form_errors: CreateRemoteServerFormErrors::default(),
+            password_visible: false,
+            password_keychain_status: PasswordKeychainStatus::Unknown,
+            password_keychain_url: None,
+            password_autoload_url: None,
             address_error: None,
             ssh_prompt: None,
             _creating: None,
         }
+    }
+
+    fn rebuild_with(
+        &self,
+        address_error: Option<SharedString>,
+        ssh_prompt: Option<Entity<RemoteConnectionPrompt>>,
+        creating: Option<Task<Option<()>>>,
+        form_errors: Option<CreateRemoteServerFormErrors>,
+    ) -> Self {
+        Self {
+            input_mode: self.input_mode,
+            address_editor: self.address_editor.clone(),
+            form: self.form.clone(),
+            show_advanced: self.show_advanced,
+            show_saved_connections: self.show_saved_connections,
+            form_errors: form_errors.unwrap_or_else(|| self.form_errors.clone()),
+            password_visible: self.password_visible,
+            password_keychain_status: self.password_keychain_status,
+            password_keychain_url: self.password_keychain_url.clone(),
+            password_autoload_url: self.password_autoload_url.clone(),
+            address_error,
+            ssh_prompt,
+            _creating: creating,
+        }
+    }
+
+    fn snapshot(&self) -> Self {
+        Self {
+            input_mode: self.input_mode,
+            address_editor: self.address_editor.clone(),
+            form: self.form.clone(),
+            show_advanced: self.show_advanced,
+            show_saved_connections: self.show_saved_connections,
+            form_errors: self.form_errors.clone(),
+            password_visible: self.password_visible,
+            password_keychain_status: self.password_keychain_status,
+            password_keychain_url: self.password_keychain_url.clone(),
+            password_autoload_url: self.password_autoload_url.clone(),
+            address_error: self.address_error.clone(),
+            ssh_prompt: self.ssh_prompt.clone(),
+            _creating: None,
+        }
+    }
+
+    fn set_read_only(&self, read_only: bool, cx: &mut App) {
+        let set_read_only = |editor: &Entity<Editor>, cx: &mut App| {
+            editor.update(cx, |editor, _| editor.set_read_only(read_only));
+        };
+        set_read_only(&self.address_editor, cx);
+        set_read_only(&self.form.host_editor, cx);
+        set_read_only(&self.form.username_editor, cx);
+        set_read_only(&self.form.port_editor, cx);
+        set_read_only(&self.form.password_editor, cx);
+        set_read_only(&self.form.identity_file_editor, cx);
+        set_read_only(&self.form.jump_host_editor, cx);
+        set_read_only(&self.form.port_forwards_editor, cx);
     }
 }
 
@@ -714,6 +877,7 @@ impl RemoteServerProjects {
                         recent_projects.ssh_config_updates = spawn_ssh_config_watch(fs.clone(), cx);
                     } else {
                         recent_projects.ssh_config_servers.clear();
+                        recent_projects.ssh_config_entries.clear();
                         recent_projects.ssh_config_updates = Task::ready(());
                     }
                 }
@@ -726,6 +890,7 @@ impl RemoteServerProjects {
             retained_connections: Vec::new(),
             ssh_config_updates,
             ssh_config_servers: BTreeSet::new(),
+            ssh_config_entries: HashMap::new(),
             create_new_window,
             _subscription,
         }
@@ -758,13 +923,8 @@ impl RemoteServerProjects {
         this
     }
 
-    fn create_ssh_server(
-        &mut self,
-        editor: Entity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let input = get_text(&editor, cx);
+    fn create_ssh_server(&mut self, state: &CreateRemoteServer, window: &mut Window, cx: &mut Context<Self>) {
+        let input = get_text(&state.address_editor, cx);
         if input.is_empty() {
             return;
         }
@@ -772,15 +932,458 @@ impl RemoteServerProjects {
         let connection_options = match SshConnectionOptions::parse_command_line(&input) {
             Ok(c) => c,
             Err(e) => {
-                self.mode = Mode::CreateRemoteServer(CreateRemoteServer {
-                    address_editor: editor,
-                    address_error: Some(format!("could not parse: {:?}", e).into()),
-                    ssh_prompt: None,
-                    _creating: None,
-                });
+                self.mode = Mode::CreateRemoteServer(state.rebuild_with(
+                    Some(format!("could not parse: {:?}", e).into()),
+                    None,
+                    None,
+                    Some(CreateRemoteServerFormErrors::default()),
+                ));
                 return;
             }
         };
+        let cleared_state = state.rebuild_with(
+            None,
+            None,
+            None,
+            Some(CreateRemoteServerFormErrors::default()),
+        );
+        self.start_ssh_connection(&cleared_state, connection_options, window, cx);
+    }
+
+    fn use_ssh_config_host(
+        &mut self,
+        host: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        state.form.host_editor.update(cx, |editor, cx| {
+            editor.set_text(host.to_string(), window, cx);
+        });
+        let mut new_state = state.rebuild_with(
+            None,
+            None,
+            None,
+            Some(CreateRemoteServerFormErrors::default()),
+        );
+        new_state.input_mode = CreateRemoteServerInputMode::Form;
+        self.mode = Mode::CreateRemoteServer(new_state);
+        state.form.host_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn use_ssh_config_defaults(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        let host = get_text(&state.form.host_editor, cx);
+        if host.is_empty() {
+            return;
+        }
+        let Some(entry) = self.ssh_config_entries.get(host.as_str()) else {
+            return;
+        };
+
+        let mut new_errors = state.form_errors.clone();
+        new_errors.host = None;
+        if let Some(user) = entry.user.as_deref() {
+            let current = get_text(&state.form.username_editor, cx);
+            if current.is_empty() {
+                state.form.username_editor.update(cx, |editor, cx| {
+                    editor.set_text(user, window, cx);
+                });
+            }
+        }
+
+        if let Some(port) = entry.port {
+            let current = get_text(&state.form.port_editor, cx);
+            if current.is_empty() {
+                state.form.port_editor.update(cx, |editor, cx| {
+                    editor.set_text(port.to_string(), window, cx);
+                });
+                new_errors.port = None;
+            }
+        }
+
+        let new_state = state.rebuild_with(None, None, None, Some(new_errors));
+        self.mode = Mode::CreateRemoteServer(new_state);
+        cx.notify();
+    }
+
+    fn create_ssh_server_from_form(
+        &mut self,
+        state: &CreateRemoteServer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let connection_options = match self.build_ssh_connection_from_form(state, cx) {
+            Ok(options) => options,
+            Err(errors) => {
+                let mut new_state = state.rebuild_with(None, None, None, Some(errors));
+                if !new_state.form_errors.port_forwards.is_empty() {
+                    new_state.show_advanced = true;
+                }
+                self.mode = Mode::CreateRemoteServer(new_state);
+                return;
+            }
+        };
+
+        let cleared_state = state.rebuild_with(
+            None,
+            None,
+            None,
+            Some(CreateRemoteServerFormErrors::default()),
+        );
+        self.start_ssh_connection(&cleared_state, connection_options, window, cx);
+    }
+
+    fn build_ssh_connection_from_form(
+        &self,
+        state: &CreateRemoteServer,
+        cx: &mut Context<Self>,
+    ) -> Result<SshConnectionOptions, CreateRemoteServerFormErrors> {
+        let mut errors = CreateRemoteServerFormErrors::default();
+        let mut host = get_text(&state.form.host_editor, cx);
+        if host.is_empty() {
+            errors.host = Some("Host is required".into());
+        }
+
+        let mut username = Some(get_text(&state.form.username_editor, cx)).filter(|t| !t.is_empty());
+        if username.is_none() {
+            if let Some((user, host_part)) = split_user_host(&host) {
+                username = Some(user);
+                host = host_part;
+            }
+        }
+
+        let port = {
+            let port_text = get_text(&state.form.port_editor, cx);
+            if port_text.is_empty() {
+                None
+            } else {
+                match port_text.parse::<u16>() {
+                    Ok(port) if port > 0 => Some(port),
+                    Ok(_) => {
+                        errors.port = Some("Port must be between 1 and 65535".into());
+                        None
+                    }
+                    Err(_) => {
+                        errors.port = Some("Port must be a number".into());
+                        None
+                    }
+                }
+            }
+        };
+
+        let identity_file = get_text(&state.form.identity_file_editor, cx);
+        let jump_host = get_text(&state.form.jump_host_editor, cx);
+        let port_forwards = get_text(&state.form.port_forwards_editor, cx);
+        let password = state.form.password_editor.read(cx).text(cx).to_string();
+
+        let mut args = Vec::new();
+        if !identity_file.is_empty() {
+            args.push("-i".to_string());
+            args.push(identity_file);
+        }
+        if !jump_host.is_empty() {
+            args.push("-J".to_string());
+            args.push(jump_host);
+        }
+
+        let (port_forwards, port_forward_errors) = parse_port_forwards(&port_forwards);
+        if !port_forward_errors.is_empty() {
+            errors.port_forwards = port_forward_errors;
+        }
+
+        let mut connection_options = SshConnectionOptions {
+            host: host.into(),
+            username,
+            port,
+            ..SshConnectionOptions::default()
+        };
+        if !password.is_empty() {
+            connection_options.password = Some(password);
+        }
+        if !args.is_empty() {
+            connection_options.args = Some(args);
+        }
+        if !port_forwards.is_empty() {
+            connection_options.port_forwards = Some(port_forwards);
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        Ok(connection_options)
+    }
+
+    fn show_save_toast(&self, message: impl Into<SharedString>, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let message: SharedString = message.into();
+        let message_text = message.to_string();
+        workspace.update(cx, |workspace, cx| {
+            struct SshSaveToast;
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::composite::<SshSaveToast>(message_text.clone()),
+                    message_text.clone(),
+                )
+                .autohide(),
+                cx,
+            );
+        });
+    }
+
+    fn save_ssh_connection_options(
+        &mut self,
+        connection_options: SshConnectionOptions,
+        cx: &mut Context<Self>,
+    ) {
+        let host = connection_options.host.to_string();
+        let username = connection_options.username.clone();
+        let port = connection_options.port;
+        let args = connection_options.args.unwrap_or_default();
+        let port_forwards = connection_options.port_forwards.clone();
+        let connection_timeout = connection_options.connection_timeout;
+
+        self.update_settings_file(cx, move |setting, _| {
+            let connections = setting
+                .ssh_connections
+                .get_or_insert(Default::default());
+            let mut existing = None;
+            connections.retain(|connection| {
+                let is_match = connection.host == host
+                    && connection.username == username
+                    && connection.port == port;
+                if is_match && existing.is_none() {
+                    existing = Some(connection.clone());
+                }
+                !is_match
+            });
+
+            let mut entry = existing.unwrap_or_else(|| SshConnection {
+                host: host.clone(),
+                username: username.clone(),
+                port,
+                projects: BTreeSet::new(),
+                nickname: None,
+                args: Vec::new(),
+                upload_binary_over_ssh: None,
+                port_forwards: None,
+                connection_timeout: None,
+            });
+            entry.args = args.clone();
+            entry.port_forwards = port_forwards.clone();
+            entry.connection_timeout = connection_timeout;
+            connections.push(entry);
+        });
+    }
+
+    fn remove_saved_connection(&mut self, connection: &SshConnection, cx: &mut Context<Self>) {
+        let connection = connection.clone();
+        self.update_settings_file(cx, move |setting, _| {
+            if let Some(connections) = setting.ssh_connections.as_mut() {
+                connections.retain(|existing| existing != &connection);
+            }
+        });
+    }
+
+    fn confirm_remove_saved_connection(
+        &mut self,
+        connection: SshConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let connection_string =
+            SshConnectionOptions::from(connection.clone()).connection_string();
+        let prompt_message = format!("Delete saved connection `{}`?", connection_string);
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            &prompt_message,
+            None,
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let remote_servers = cx.entity();
+        cx.spawn(async move |_, cx| {
+            if confirmation.await.ok() == Some(0) {
+                remote_servers.update(cx, |this, cx| {
+                    this.remove_saved_connection(&connection, cx);
+                    this.show_save_toast("Saved connection deleted.", cx);
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn confirm_remove_all_saved_connections(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            "Delete all saved connections?",
+            Some("This will clear the saved connection history."),
+            &["Delete all", "Cancel"],
+            cx,
+        );
+        let remote_servers = cx.entity();
+        cx.spawn(async move |_, cx| {
+            if confirmation.await.ok() == Some(0) {
+                remote_servers.update(cx, |this, cx| {
+                    this.update_settings_file(cx, |setting, _| {
+                        if let Some(connections) = setting.ssh_connections.as_mut() {
+                            connections.clear();
+                        }
+                    });
+                    this.show_save_toast("All saved connections deleted.", cx);
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn set_editor_text(
+        editor: &Entity<Editor>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+        });
+    }
+
+    fn apply_saved_connection(
+        &mut self,
+        connection: SshConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = if let Mode::CreateRemoteServer(state) = &mut self.mode {
+            state
+        } else {
+            return;
+        };
+
+        state.input_mode = CreateRemoteServerInputMode::Form;
+        Self::set_editor_text(&state.form.host_editor, &connection.host, window, cx);
+        if let Some(username) = &connection.username {
+            Self::set_editor_text(&state.form.username_editor, username, window, cx);
+        } else {
+            Self::set_editor_text(&state.form.username_editor, "", window, cx);
+        }
+        if let Some(port) = connection.port {
+            Self::set_editor_text(&state.form.port_editor, &port.to_string(), window, cx);
+        } else {
+            Self::set_editor_text(&state.form.port_editor, "", window, cx);
+        }
+
+        let mut identity_file = None;
+        let mut jump_host = None;
+        let mut args_iter = connection.args.iter();
+        while let Some(arg) = args_iter.next() {
+            if arg == "-i" {
+                identity_file = args_iter.next().cloned();
+            } else if let Some(rest) = arg.strip_prefix("-i") {
+                if !rest.is_empty() {
+                    identity_file = Some(rest.to_string());
+                }
+            } else if arg == "-J" {
+                jump_host = args_iter.next().cloned();
+            } else if let Some(rest) = arg.strip_prefix("-J") {
+                if !rest.is_empty() {
+                    jump_host = Some(rest.to_string());
+                }
+            }
+        }
+
+        let has_identity_file = identity_file.is_some();
+        let has_jump_host = jump_host.is_some();
+        if let Some(identity_file) = identity_file {
+            Self::set_editor_text(&state.form.identity_file_editor, &identity_file, window, cx);
+        } else {
+            Self::set_editor_text(&state.form.identity_file_editor, "", window, cx);
+        }
+        if let Some(jump_host) = jump_host {
+            Self::set_editor_text(&state.form.jump_host_editor, &jump_host, window, cx);
+        } else {
+            Self::set_editor_text(&state.form.jump_host_editor, "", window, cx);
+        }
+
+        let has_port_forwards =
+            connection.port_forwards.as_ref().is_some_and(|pf| !pf.is_empty());
+        if let Some(port_forwards) = connection.port_forwards.as_ref() {
+            let formatted = port_forwards
+                .iter()
+                .map(|pf| {
+                    let local_host = pf.local_host.as_deref().unwrap_or("localhost");
+                    let remote_host = pf.remote_host.as_deref().unwrap_or("localhost");
+                    format!(
+                        "{local_host}:{}:{remote_host}:{}",
+                        pf.local_port, pf.remote_port
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Self::set_editor_text(&state.form.port_forwards_editor, &formatted, window, cx);
+        } else {
+            Self::set_editor_text(&state.form.port_forwards_editor, "", window, cx);
+        }
+
+        state.show_advanced = has_identity_file
+            || has_jump_host
+            || has_port_forwards;
+        state.form_errors = CreateRemoteServerFormErrors::default();
+        state.address_error = None;
+        cx.notify();
+    }
+
+    fn set_command_text(
+        &mut self,
+        command: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Mode::CreateRemoteServer(state) = &mut self.mode {
+            state.input_mode = CreateRemoteServerInputMode::Command;
+            state.address_editor.update(cx, |editor, cx| {
+                editor.set_text(command, window, cx);
+            });
+            state.address_error = None;
+            cx.notify();
+        }
+    }
+
+    fn ssh_command_string(connection: &SshConnection) -> String {
+        let options: SshConnectionOptions = connection.clone().into();
+        let mut parts = vec!["ssh".to_string()];
+        parts.extend(options.additional_args());
+        parts.push(options.ssh_destination());
+        parts.join(" ")
+    }
+
+    fn start_ssh_connection(
+        &mut self,
+        state: &CreateRemoteServer,
+        connection_options: SshConnectionOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ssh_prompt = cx.new(|cx| {
             RemoteConnectionPrompt::new(
                 connection_options.connection_string(),
@@ -792,6 +1395,15 @@ impl RemoteServerProjects {
             )
         });
 
+        let build_remote_server = std::env::var("ZED_BUILD_REMOTE_SERVER")
+            .map(|value| !matches!(value.as_str(), "false" | "no" | "off" | "0"))
+            .unwrap_or(true);
+        let timeout = if cfg!(debug_assertions) || build_remote_server {
+            START_PROXY_TIMEOUT_WITH_BUILD
+        } else {
+            START_PROXY_TIMEOUT
+        };
+
         let connection = connect(
             ConnectionIdentifier::setup(),
             RemoteConnectionOptions::Ssh(connection_options.clone()),
@@ -799,49 +1411,409 @@ impl RemoteServerProjects {
             window,
             cx,
         )
-        .prompt_err("Failed to connect", window, cx, |_, _, _| None);
+        .prompt_err("Failed to connect", window, cx, |_, _, _| None)
+        .with_timeout(timeout, cx.background_executor());
 
-        let address_editor = editor.clone();
+        let restore_state = state.rebuild_with(None, None, None, None);
         let creating = cx.spawn_in(window, async move |this, cx| {
             match connection.await {
-                Some(Some(client)) => this
+                Ok(Some(Some(client))) => this
                     .update_in(cx, |this, window, cx| {
+                        let client: Entity<RemoteClient> = client;
                         info!("ssh server created");
                         telemetry::event!("SSH Server Created");
-                        this.retained_connections.push(client);
-                        this.add_ssh_server(connection_options, cx);
-                        this.mode = Mode::default_mode(&this.ssh_config_servers, cx);
-                        this.focus_handle(cx).focus(window, cx);
+                        let connection_options = connection_options.clone();
+                        this.save_ssh_connection_options(connection_options.clone(), cx);
+                        let server_index =
+                            this.add_ssh_server_with_index(connection_options.clone(), cx);
+                        this.retained_connections.push(client.clone());
+                        if !this.show_project_picker_with_session(
+                            server_index.into(),
+                            RemoteConnectionOptions::Ssh(connection_options),
+                            client,
+                            window,
+                            cx,
+                        ) {
+                            this.mode = Mode::default_mode(&this.ssh_config_servers, cx);
+                            this.focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }
+                    })
+                    .log_err(),
+                Ok(_) => this
+                    .update(cx, |this, cx| {
+                        restore_state.set_read_only(false, cx);
+                        this.mode = Mode::CreateRemoteServer(restore_state);
                         cx.notify()
                     })
                     .log_err(),
-                _ => this
-                    .update(cx, |this, cx| {
-                        address_editor.update(cx, |this, _| {
-                            this.set_read_only(false);
-                        });
-                        this.mode = Mode::CreateRemoteServer(CreateRemoteServer {
-                            address_editor,
-                            address_error: None,
-                            ssh_prompt: None,
-                            _creating: None,
-                        });
-                        cx.notify()
+                Err(_) => this
+                    .update_in(cx, |this, window, cx| {
+                        restore_state.set_read_only(false, cx);
+                        this.mode = Mode::CreateRemoteServer(restore_state);
+                        cx.notify();
+                        drop(window.prompt(
+                            PromptLevel::Critical,
+                            "Failed to connect",
+                            Some("Timed out while starting proxy. Please try again."),
+                            &["Ok"],
+                            cx,
+                        ));
                     })
                     .log_err(),
             };
             None
         });
 
-        editor.update(cx, |this, _| {
-            this.set_read_only(true);
+        state.set_read_only(true, cx);
+        self.mode = Mode::CreateRemoteServer(state.rebuild_with(
+            None,
+            Some(ssh_prompt),
+            Some(creating),
+            None,
+        ));
+    }
+
+    fn ssh_keychain_url_from_form(
+        &self,
+        state: &CreateRemoteServer,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, String)> {
+        let mut host = get_text(&state.form.host_editor, cx);
+        if host.is_empty() {
+            return None;
+        }
+        let mut username =
+            Some(get_text(&state.form.username_editor, cx)).filter(|t| !t.is_empty());
+        if username.is_none() {
+            if let Some((user, host_part)) = split_user_host(&host) {
+                username = Some(user);
+                host = host_part;
+            }
+        }
+        let port_text = get_text(&state.form.port_editor, cx);
+        if port_text.is_empty() {
+            return None;
+        }
+        let port = port_text
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0);
+        let username = username?;
+
+        let connection = SshConnectionOptions {
+            host: host.into(),
+            username: Some(username.clone()),
+            port,
+            ..SshConnectionOptions::default()
+        };
+        let url = format!("ssh://{}", connection.connection_string());
+        Some((url, username))
+    }
+
+    fn maybe_refresh_password_state(
+        &mut self,
+        state: &CreateRemoteServer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((url, _username)) = self.ssh_keychain_url_from_form(state, cx) else {
+            if state.password_keychain_url.is_some()
+                || state.password_keychain_status != PasswordKeychainStatus::Unknown
+            {
+                let mut new_state = state.rebuild_with(None, None, None, None);
+                new_state.password_keychain_url = None;
+                new_state.password_keychain_status = PasswordKeychainStatus::Unknown;
+                new_state.password_autoload_url = None;
+                self.mode = Mode::CreateRemoteServer(new_state);
+                cx.notify();
+            }
+            return;
+        };
+
+        if state.password_keychain_url.as_deref() == Some(url.as_str())
+            && state.password_keychain_status != PasswordKeychainStatus::Unknown
+        {
+            return;
+        }
+
+        let auto_fill = state.form.password_editor.read(cx).text(cx).is_empty()
+            && state.password_autoload_url.as_deref() != Some(url.as_str());
+        let mut new_state = state.rebuild_with(None, None, None, None);
+        new_state.password_keychain_url = Some(url.clone());
+        new_state.password_keychain_status = PasswordKeychainStatus::Loading;
+        if auto_fill {
+            new_state.password_autoload_url = Some(url.clone());
+        }
+        self.mode = Mode::CreateRemoteServer(new_state);
+        cx.notify();
+
+        let read_task = cx.read_credentials(&url);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read_task.await;
+            this.update_in(cx, |this, window, cx| {
+                let Mode::CreateRemoteServer(state) = &this.mode else {
+                    return;
+                };
+                if state.password_keychain_url.as_deref() != Some(url.as_str()) {
+                    return;
+                }
+
+                let mut new_state = state.rebuild_with(None, None, None, None);
+                match result {
+                    Ok(Some((_user, bytes))) => match String::from_utf8(bytes) {
+                        Ok(password) => {
+                            new_state.password_keychain_status =
+                                PasswordKeychainStatus::Saved;
+                            if auto_fill
+                                && state.form.password_editor.read(cx).text(cx).is_empty()
+                            {
+                                state.form.password_editor.update(cx, |editor, cx| {
+                                    editor.set_text(password, window, cx);
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            new_state.password_keychain_status =
+                                PasswordKeychainStatus::Error;
+                        }
+                    },
+                    Ok(None) => {
+                        new_state.password_keychain_status = PasswordKeychainStatus::NotSaved;
+                    }
+                    Err(error) => {
+                        log::error!("Failed to read ssh password: {error:#}");
+                        new_state.password_keychain_status = PasswordKeychainStatus::Error;
+                    }
+                }
+                this.mode = Mode::CreateRemoteServer(new_state);
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn toggle_password_visibility(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        let new_visible = !state.password_visible;
+        state.form.password_editor.update(cx, |editor, cx| {
+            editor.set_masked(!new_visible, cx);
         });
-        self.mode = Mode::CreateRemoteServer(CreateRemoteServer {
-            address_editor: editor,
-            address_error: None,
-            ssh_prompt: Some(ssh_prompt),
-            _creating: Some(creating),
+        let mut new_state = state.rebuild_with(None, None, None, None);
+        new_state.password_visible = new_visible;
+        self.mode = Mode::CreateRemoteServer(new_state);
+        cx.notify();
+    }
+
+    fn show_password_toast(&self, message: impl Into<SharedString>, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let message = message.into();
+        let message_text = message.to_string();
+        workspace.update(cx, |workspace, cx| {
+            struct SshPasswordToast;
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::composite::<SshPasswordToast>(message.clone()),
+                    message_text.clone(),
+                )
+                .autohide(),
+                cx,
+            );
         });
+    }
+
+    fn use_saved_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        let Some((url, _username)) = self.ssh_keychain_url_from_form(&state, cx) else {
+            self.show_password_toast("Enter host, username, and port first.", cx);
+            return;
+        };
+        if !state.form.password_editor.read(cx).text(cx).is_empty() {
+            self.show_password_toast("Password field is not empty.", cx);
+            return;
+        }
+
+        let read_task = cx.read_credentials(&url);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read_task.await;
+            this.update_in(cx, |this, window, cx| {
+                let Mode::CreateRemoteServer(state) = &this.mode else {
+                    return;
+                };
+                let mut updated = state.rebuild_with(None, None, None, None);
+                updated.password_keychain_url = Some(url.clone());
+                match result {
+                    Ok(Some((_user, bytes))) => match String::from_utf8(bytes) {
+                        Ok(password) => {
+                            state.form.password_editor.update(cx, |editor, cx| {
+                                editor.set_text(password, window, cx);
+                            });
+                            updated.password_keychain_status = PasswordKeychainStatus::Saved;
+                            updated.password_autoload_url = Some(url.clone());
+                            this.show_password_toast("Password loaded from keychain.", cx);
+                        }
+                        Err(_) => {
+                            updated.password_keychain_status = PasswordKeychainStatus::Error;
+                            this.show_password_toast(
+                                "Saved password is not valid UTF-8.",
+                                cx,
+                            );
+                        }
+                    },
+                    Ok(None) => {
+                        updated.password_keychain_status = PasswordKeychainStatus::NotSaved;
+                        this.show_password_toast("No saved password for this host.", cx);
+                    }
+                    Err(error) => {
+                        log::error!("Failed to read ssh password: {error:#}");
+                        updated.password_keychain_status = PasswordKeychainStatus::Error;
+                        this.show_password_toast("Failed to read saved password.", cx);
+                    }
+                }
+                this.mode = Mode::CreateRemoteServer(updated);
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn save_password_to_keychain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        let Some((url, username)) = self.ssh_keychain_url_from_form(&state, cx) else {
+            self.show_password_toast("Enter host, username, and port first.", cx);
+            return;
+        };
+        let password = state.form.password_editor.read(cx).text(cx).to_string();
+        if password.is_empty() {
+            self.show_password_toast("Enter a password to save.", cx);
+            return;
+        }
+
+        let write_task = cx.write_credentials(&url, &username, password.as_bytes());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = write_task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Mode::CreateRemoteServer(state) = &this.mode {
+                            let mut updated = state.rebuild_with(None, None, None, None);
+                            updated.password_keychain_status = PasswordKeychainStatus::Saved;
+                            updated.password_keychain_url = Some(url.clone());
+                            this.mode = Mode::CreateRemoteServer(updated);
+                        }
+                        this.show_password_toast("Password saved to keychain.", cx);
+                    }
+                    Err(error) => {
+                        log::error!("Failed to save ssh password: {error:#}");
+                        if let Mode::CreateRemoteServer(state) = &this.mode {
+                            let mut updated = state.rebuild_with(None, None, None, None);
+                            updated.password_keychain_status = PasswordKeychainStatus::Error;
+                            updated.password_keychain_url = Some(url.clone());
+                            this.mode = Mode::CreateRemoteServer(updated);
+                        }
+                        this.show_password_toast("Failed to save password.", cx);
+                    }
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn delete_saved_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        let Some((url, _username)) = self.ssh_keychain_url_from_form(&state, cx) else {
+            self.show_password_toast("Enter host, username, and port first.", cx);
+            return;
+        };
+
+        let delete_task = cx.delete_credentials(&url);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = delete_task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Mode::CreateRemoteServer(state) = &this.mode {
+                            let mut updated = state.rebuild_with(None, None, None, None);
+                            updated.password_keychain_status = PasswordKeychainStatus::NotSaved;
+                            updated.password_keychain_url = Some(url.clone());
+                            this.mode = Mode::CreateRemoteServer(updated);
+                        }
+                        this.show_password_toast("Saved password deleted.", cx);
+                    }
+                    Err(error) => {
+                        log::error!("Failed to delete ssh password: {error:#}");
+                        if let Mode::CreateRemoteServer(state) = &this.mode {
+                            let mut updated = state.rebuild_with(None, None, None, None);
+                            updated.password_keychain_status = PasswordKeychainStatus::Error;
+                            updated.password_keychain_url = Some(url.clone());
+                            this.mode = Mode::CreateRemoteServer(updated);
+                        }
+                        this.show_password_toast("Failed to delete saved password.", cx);
+                    }
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn pick_identity_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = match &self.mode {
+            Mode::CreateRemoteServer(state) => state.snapshot(),
+            _ => return,
+        };
+        if state.ssh_prompt.is_some() || state._creating.is_some() {
+            return;
+        }
+
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select SSH identity file".into()),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = match prompt.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    log::error!("Failed to prompt for identity file: {error}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path_text = path.to_string_lossy().to_string();
+            this.update_in(cx, move |this, window, cx| {
+                let Mode::CreateRemoteServer(state) = &this.mode else {
+                    return;
+                };
+                state.form.identity_file_editor.update(cx, |editor, cx| {
+                    editor.set_text(path_text, window, cx);
+                });
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     #[cfg(target_os = "windows")]
@@ -956,6 +1928,88 @@ impl RemoteServerProjects {
         cx.notify();
     }
 
+    fn retained_connection_for(
+        &self,
+        connection_options: &RemoteConnectionOptions,
+        cx: &App,
+    ) -> Option<Entity<RemoteClient>> {
+        self.retained_connections.iter().find_map(|client| {
+            let client_state = client.read(cx);
+            if client_state.connection_options() == *connection_options && !client_state.is_disconnected()
+            {
+                Some(client.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn show_project_picker_with_session(
+        &mut self,
+        index: ServerIndex,
+        connection_options: RemoteConnectionOptions,
+        session: Entity<RemoteClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let app_state = workspace.read_with(cx, |workspace, _| workspace.app_state().clone());
+
+        let create_new_window = self.create_new_window;
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let (path_style, project) = cx
+                .update(|_, cx| {
+                    (
+                        session.read(cx).path_style(),
+                    project::Project::remote(
+                        session.clone(),
+                        app_state.client.clone(),
+                        app_state.node_runtime.clone(),
+                        app_state.user_store.clone(),
+                        app_state.languages.clone(),
+                        app_state.fs.clone(),
+                        true,
+                        cx,
+                    ),
+                )
+                })
+                .log_err()?;
+
+            let home_dir = project
+                .read_with(cx, |project, cx| project.resolve_abs_path("~", cx))
+                .await
+                .and_then(|path| path.into_abs_path())
+                .map(|path| RemotePathBuf::new(path, path_style))
+                .unwrap_or_else(|| match path_style {
+                    PathStyle::Posix => RemotePathBuf::from_str("/", PathStyle::Posix),
+                    PathStyle::Windows => RemotePathBuf::from_str("C:\\", PathStyle::Windows),
+                });
+
+            this.update_in(cx, |this, window, cx| {
+                this.mode = Mode::ProjectPicker(ProjectPicker::new(
+                    create_new_window,
+                    index,
+                    connection_options,
+                    project,
+                    home_dir,
+                    workspace,
+                    window,
+                    cx,
+                ));
+                this.focus_handle(cx).focus(window, cx);
+                cx.notify();
+            })
+            .log_err();
+            None::<()>
+        })
+        .detach();
+
+        true
+    }
+
     fn create_remote_project(
         &mut self,
         index: ServerIndex,
@@ -963,6 +2017,18 @@ impl RemoteServerProjects {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(session) = self.retained_connection_for(&connection_options, cx) {
+            if self.show_project_picker_with_session(
+                index,
+                connection_options.clone(),
+                session,
+                window,
+                cx,
+            ) {
+                return;
+            }
+        }
+
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1062,19 +2128,33 @@ impl RemoteServerProjects {
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let create_state = match &self.mode {
+            Mode::CreateRemoteServer(state) => Some(state.snapshot()),
+            _ => None,
+        };
+        if let Some(state) = create_state {
+            if let Some(prompt) = state.ssh_prompt.as_ref() {
+                prompt.update(cx, |prompt, cx| {
+                    prompt.confirm(window, cx);
+                });
+                return;
+            }
+
+            match state.input_mode {
+                CreateRemoteServerInputMode::Command => {
+                    self.create_ssh_server(&state, window, cx);
+                }
+                CreateRemoteServerInputMode::Form => {
+                    self.create_ssh_server_from_form(&state, window, cx);
+                }
+            }
+            return;
+        }
+
         match &self.mode {
             Mode::Default(_) | Mode::ViewServerOptions(_) => {}
             Mode::ProjectPicker(_) => {}
-            Mode::CreateRemoteServer(state) => {
-                if let Some(prompt) = state.ssh_prompt.as_ref() {
-                    prompt.update(cx, |prompt, cx| {
-                        prompt.confirm(window, cx);
-                    });
-                    return;
-                }
-
-                self.create_ssh_server(state.address_editor.clone(), window, cx);
-            }
+            Mode::CreateRemoteServer(_) => {}
             Mode::CreateRemoteDevContainer(_) => {}
             Mode::EditNickname(state) => {
                 let text = Some(state.editor.read(cx).text(cx)).filter(|text| !text.is_empty());
@@ -1102,12 +2182,8 @@ impl RemoteServerProjects {
         match &self.mode {
             Mode::Default(_) => cx.emit(DismissEvent),
             Mode::CreateRemoteServer(state) if state.ssh_prompt.is_some() => {
-                let new_state = CreateRemoteServer::new(window, cx);
-                let old_prompt = state.address_editor.read(cx).text(cx);
-                new_state.address_editor.update(cx, |this, cx| {
-                    this.set_text(old_prompt, window, cx);
-                });
-
+                let new_state = state.rebuild_with(None, None, None, None);
+                new_state.set_read_only(false, cx);
                 self.mode = Mode::CreateRemoteServer(new_state);
                 cx.notify();
             }
@@ -1888,20 +2964,724 @@ impl RemoteServerProjects {
     }
 
     fn render_create_remote_server(
-        &self,
-        state: &CreateRemoteServer,
+        &mut self,
+        state: CreateRemoteServer,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if state.form.port_editor.read(cx).text(cx).is_empty() {
+            state.form.port_editor.update(cx, |editor, cx| {
+                editor.set_text("22", window, cx);
+            });
+        }
+        self.maybe_refresh_password_state(&state, window, cx);
         let ssh_prompt = state.ssh_prompt.clone();
 
         state.address_editor.update(cx, |editor, cx| {
             if editor.text(cx).is_empty() {
-                editor.set_placeholder_text("ssh user@example -p 2222", window, cx);
+                editor.set_placeholder_text(
+                    "user@host, host alias, or ssh command",
+                    window,
+                    cx,
+                );
             }
         });
 
+        let selected_host = get_text(&state.form.host_editor, cx);
+        let password_text = state.form.password_editor.read(cx).text(cx);
+        let keychain_ready = self.ssh_keychain_url_from_form(&state, cx).is_some();
         let theme = cx.theme();
+        let input_mode = state.input_mode;
+        let ssh_settings = RemoteSettings::get_global(cx);
+        let saved_connections_raw: Vec<SshConnection> = ssh_settings.ssh_connections().collect();
+        let mut saved_connections = Vec::new();
+        let mut seen_connections = HashSet::new();
+        for connection in saved_connections_raw {
+            let key = (
+                connection.host.clone(),
+                connection.username.clone(),
+                connection.port,
+            );
+            if seen_connections.insert(key) {
+                saved_connections.push(connection);
+            }
+        }
+        let mut ssh_config_hosts = if ssh_settings.read_ssh_config {
+            self.ssh_config_servers.clone()
+        } else {
+            BTreeSet::new()
+        };
+        for connection in &saved_connections {
+            ssh_config_hosts.remove(connection.host.as_str());
+        }
+        let read_ssh_config = ssh_settings.read_ssh_config;
+        let show_quick_pick = ssh_prompt.is_none() && state.address_error.is_none();
+        let saved_connections_total = saved_connections.len();
+        let visible_saved_connections: Vec<SshConnection> = saved_connections
+            .iter()
+            .take(SAVED_CONNECTIONS_LIMIT)
+            .cloned()
+            .collect();
+        let saved_connections_truncated =
+            saved_connections_total > visible_saved_connections.len();
+
+        let mode_toggle = ToggleButtonGroup::single_row(
+            "ssh-input-mode",
+            [
+                ToggleButtonSimple::new("Form", cx.listener(|this, _, window, cx| {
+                    if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                        state.input_mode = CreateRemoteServerInputMode::Form;
+                        state.form.host_editor.focus_handle(cx).focus(window, cx);
+                        cx.notify();
+                    }
+                })),
+                ToggleButtonSimple::new("SSH Command", cx.listener(|this, _, window, cx| {
+                    if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                        state.input_mode = CreateRemoteServerInputMode::Command;
+                        state.address_editor.focus_handle(cx).focus(window, cx);
+                        cx.notify();
+                    }
+                })),
+            ],
+        )
+        .style(ToggleButtonGroupStyle::Outlined)
+        .label_size(LabelSize::Small)
+        .auto_width()
+        .selected_index(match input_mode {
+            CreateRemoteServerInputMode::Form => 0,
+            CreateRemoteServerInputMode::Command => 1,
+        });
+
+        let mut host_history = BTreeSet::new();
+        let mut username_history = BTreeSet::new();
+        let mut port_history = BTreeSet::new();
+        let mut command_history = BTreeMap::new();
+        for connection in &saved_connections {
+            host_history.insert(connection.host.clone());
+            if let Some(username) = &connection.username {
+                username_history.insert(username.clone());
+            }
+            if let Some(port) = connection.port {
+                port_history.insert(port.to_string());
+            }
+            let command = Self::ssh_command_string(connection);
+            command_history
+                .entry(command)
+                .or_insert_with(|| connection.clone());
+        }
+        let host_history: Vec<SharedString> =
+            host_history.into_iter().map(SharedString::from).collect();
+        let username_history: Vec<SharedString> =
+            username_history.into_iter().map(SharedString::from).collect();
+        let port_history: Vec<SharedString> =
+            port_history.into_iter().map(SharedString::from).collect();
+        let command_history: Vec<(SharedString, SshConnection)> = command_history
+            .into_iter()
+            .map(|(command, connection)| (SharedString::from(command), connection))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+        let history_menu = |id: &'static str,
+                            entries: Vec<SharedString>,
+                            tooltip: &'static str,
+                            on_select: Rc<dyn Fn(SharedString, &mut Window, &mut App)>| {
+            let has_entries = !entries.is_empty();
+            PopoverMenu::new(id)
+                .trigger(
+                    IconButton::new(format!("{id}-history"), IconName::HistoryRerun)
+                        .icon_size(IconSize::Small)
+                        .shape(IconButtonShape::Square)
+                        .size(ButtonSize::Large)
+                        .tooltip(Tooltip::text(tooltip))
+                        .disabled(!has_entries),
+                )
+                .menu({
+                    let entries = entries.clone();
+                    let on_select = on_select.clone();
+                    move |window, cx| {
+                        let entries = entries.clone();
+                        let on_select = on_select.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            if entries.is_empty() {
+                                menu = menu.header("No saved entries");
+                            } else {
+                                for entry in entries.iter() {
+                                    let entry = entry.clone();
+                                    let on_select = on_select.clone();
+                                    menu = menu.entry(entry.clone(), None, move |window, cx| {
+                                        on_select(entry.clone(), window, cx);
+                                    });
+                                }
+                            }
+                            menu
+                        }))
+                    }
+                })
+        };
+
+        let field = |label: SharedString, editor: Entity<Editor>, error: Option<SharedString>| {
+            let mut element = v_flex()
+                .gap_0p5()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(theme.colors().border_variant)
+                        .rounded_sm()
+                        .px_2()
+                        .py_1()
+                        .child(editor),
+                );
+            if let Some(error) = error {
+                element = element.child(
+                    Label::new(error)
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                );
+            }
+            element
+        };
+
+        let field_with_trailing = |label: SharedString,
+                                   editor: Entity<Editor>,
+                                   error: Option<SharedString>,
+                                   trailing: Option<AnyElement>| {
+            let mut field = v_flex()
+                .gap_0p5()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(theme.colors().border_variant)
+                        .rounded_sm()
+                        .px_2()
+                        .py_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(div().flex_1().child(editor))
+                                .when_some(trailing, |this, trailing| this.child(trailing)),
+                        ),
+                );
+            if let Some(error) = error {
+                field = field.child(
+                    Label::new(error)
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                );
+            }
+            field
+        };
+
+        let advanced_toggle = ListItem::new("ssh-advanced-toggle")
+            .inset(true)
+            .spacing(ui::ListItemSpacing::Sparse)
+            .start_slot(
+                Icon::new(if state.show_advanced {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new("Advanced options")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                    state.show_advanced = !state.show_advanced;
+                    cx.notify();
+                }
+            }));
+
+        let ssh_config_hint = if read_ssh_config {
+            self.ssh_config_entries.get(selected_host.as_str()).map(|entry| {
+                let mut parts = Vec::new();
+                if let Some(user) = entry.user.as_deref() {
+                    parts.push(format!("user {user}"));
+                }
+                if let Some(port) = entry.port {
+                    parts.push(format!("port {port}"));
+                }
+                if let Some(hostname) = entry.hostname.as_deref() {
+                    parts.push(format!("host {hostname}"));
+                }
+                let details = if parts.is_empty() {
+                    "From SSH config".to_string()
+                } else {
+                    format!("From SSH config: {}", parts.join(", "))
+                };
+                let defaults_disabled = state.ssh_prompt.is_some() || state._creating.is_some();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(details)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("ssh-use-config-defaults", "Use config defaults")
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text(
+                                "Only fills empty fields from SSH config.",
+                            ))
+                            .disabled(defaults_disabled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.use_ssh_config_defaults(window, cx);
+                            })),
+                    )
+            })
+        } else {
+            None
+        };
+
+        let host_history_button = history_menu(
+            "ssh-host-history",
+            host_history.clone(),
+            "Host history",
+            Rc::new({
+                let weak_self = weak_self.clone();
+                move |value, window, cx| {
+                    let value = value.to_string();
+                    weak_self
+                        .update(cx, |this, cx| {
+                            if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                                Self::set_editor_text(
+                                    &state.form.host_editor,
+                                    &value,
+                                    window,
+                                    cx,
+                                );
+                                state.form_errors.host = None;
+                                state.address_error = None;
+                            }
+                        })
+                        .ok();
+                }
+            }),
+        )
+        .into_any_element();
+
+        let username_history_button = history_menu(
+            "ssh-username-history",
+            username_history.clone(),
+            "Username history",
+            Rc::new({
+                let weak_self = weak_self.clone();
+                move |value, window, cx| {
+                    let value = value.to_string();
+                    weak_self
+                        .update(cx, |this, cx| {
+                            if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                                Self::set_editor_text(
+                                    &state.form.username_editor,
+                                    &value,
+                                    window,
+                                    cx,
+                                );
+                                state.address_error = None;
+                            }
+                        })
+                        .ok();
+                }
+            }),
+        )
+        .into_any_element();
+
+        let port_history_button = history_menu(
+            "ssh-port-history",
+            port_history.clone(),
+            "Port history",
+            Rc::new({
+                let weak_self = weak_self.clone();
+                move |value, window, cx| {
+                    let value = value.to_string();
+                    weak_self
+                        .update(cx, |this, cx| {
+                            if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                                Self::set_editor_text(
+                                    &state.form.port_editor,
+                                    &value,
+                                    window,
+                                    cx,
+                                );
+                                state.form_errors.port = None;
+                                state.address_error = None;
+                            }
+                        })
+                        .ok();
+                }
+            }),
+        )
+        .into_any_element();
+
+        let form_fields = v_flex()
+            .gap_2()
+            .child(field_with_trailing(
+                "Host".into(),
+                state.form.host_editor.clone(),
+                state.form_errors.host.clone(),
+                Some(host_history_button),
+            ))
+            .when_some(ssh_config_hint, |this, hint| this.child(hint))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        field_with_trailing(
+                            "Username".into(),
+                            state.form.username_editor.clone(),
+                            None,
+                            Some(username_history_button),
+                        )
+                        .flex_1(),
+                    )
+                    .child(
+                        field_with_trailing(
+                            "Port".into(),
+                            state.form.port_editor.clone(),
+                            state.form_errors.port.clone(),
+                            Some(port_history_button),
+                        )
+                        .w(rems(8.)),
+                    ),
+            )
+            .child({
+                let busy = state.ssh_prompt.is_some() || state._creating.is_some();
+                let password_empty = password_text.is_empty();
+                let can_use_saved = keychain_ready && password_empty && !busy;
+                let can_save = keychain_ready && !password_empty && !busy;
+                let can_delete = keychain_ready && !busy;
+
+                let visibility_button = IconButton::new("ssh-password-visibility", IconName::Eye)
+                    .icon_size(IconSize::Small)
+                    .shape(IconButtonShape::Square)
+                    .size(ButtonSize::Large)
+                    .toggle_state(state.password_visible)
+                    .tooltip(Tooltip::text(if state.password_visible {
+                        "Hide password"
+                    } else {
+                        "Show password"
+                    }))
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_password_visibility(window, cx);
+                    }));
+
+                let load_button = IconButton::new("ssh-password-use", IconName::ArrowDown)
+                    .icon_size(IconSize::Small)
+                    .shape(IconButtonShape::Square)
+                    .size(ButtonSize::Large)
+                    .tooltip(Tooltip::text("Use saved password"))
+                    .disabled(!can_use_saved)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.use_saved_password(window, cx);
+                    }));
+
+                let save_button = IconButton::new("ssh-password-save", IconName::ArrowUp)
+                    .icon_size(IconSize::Small)
+                    .shape(IconButtonShape::Square)
+                    .size(ButtonSize::Large)
+                    .tooltip(Tooltip::text("Save password to keychain"))
+                    .disabled(!can_save)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.save_password_to_keychain(window, cx);
+                    }));
+
+                let delete_button = IconButton::new("ssh-password-delete", IconName::Trash)
+                    .icon_size(IconSize::Small)
+                    .shape(IconButtonShape::Square)
+                    .size(ButtonSize::Large)
+                    .tooltip(Tooltip::text("Delete saved password"))
+                    .disabled(!can_delete)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.delete_saved_password(window, cx);
+                    }));
+
+                let (status_label, status_color) = if !keychain_ready {
+                    ("Enter host, username, and port to check keychain.", Color::Muted)
+                } else {
+                    match state.password_keychain_status {
+                        PasswordKeychainStatus::Unknown => {
+                            ("Stored in the system keychain.", Color::Muted)
+                        }
+                        PasswordKeychainStatus::Loading => ("Checking keychain...", Color::Muted),
+                        PasswordKeychainStatus::Saved => ("Saved in keychain.", Color::Success),
+                        PasswordKeychainStatus::NotSaved => ("Not saved.", Color::Muted),
+                        PasswordKeychainStatus::Error => ("Keychain error.", Color::Error),
+                    }
+                };
+
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_end()
+                            .child(
+                                field(
+                                    "Password".into(),
+                                    state.form.password_editor.clone(),
+                                    None,
+                                )
+                                .flex_1(),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(visibility_button)
+                                    .child(load_button)
+                                    .child(save_button)
+                                    .child(delete_button),
+                            ),
+                    )
+                    .child(
+                        Label::new(status_label)
+                            .size(LabelSize::Small)
+                            .color(status_color),
+                    )
+            })
+            .child(advanced_toggle)
+            .when(state.show_advanced, |this| {
+                let identity_button = IconButton::new(
+                    "ssh-identity-file-browse",
+                    IconName::FolderOpen,
+                )
+                .icon_size(IconSize::Small)
+                .shape(IconButtonShape::Square)
+                .size(ButtonSize::Large)
+                .tooltip(Tooltip::text("Choose identity file"))
+                .disabled(state.ssh_prompt.is_some() || state._creating.is_some())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.pick_identity_file(window, cx);
+                }));
+
+                let mut advanced = this
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_end()
+                            .child(
+                                field(
+                                    "Identity file".into(),
+                                    state.form.identity_file_editor.clone(),
+                                    None,
+                                )
+                                .flex_1(),
+                            )
+                            .child(identity_button),
+                    )
+                    .child(
+                        Label::new("Select a private key file.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(field(
+                        "Jump host".into(),
+                        state.form.jump_host_editor.clone(),
+                        None,
+                    ))
+                    .child(field(
+                        "Port forwards".into(),
+                        state.form.port_forwards_editor.clone(),
+                        None,
+                    ));
+                if !state.form_errors.port_forwards.is_empty() {
+                    for error in &state.form_errors.port_forwards {
+                        advanced = advanced.child(
+                            Label::new(error.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        );
+                    }
+                }
+                advanced
+                    .child(
+                        Label::new(
+                            "Port forward format: local_port:remote_host:remote_port",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(
+                            "or local_host:local_port:remote_host:remote_port (comma or newline separated).",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+            });
+
+        let command_history_section = if command_history.is_empty() {
+            None
+        } else {
+            Some(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        Label::new("Command history")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        List::new().children(
+                            command_history
+                                .iter()
+                                .enumerate()
+                                .map(|(ix, (command, connection))| {
+                                    ListItem::new(("ssh-command-history", ix))
+                                        .inset(true)
+                                        .spacing(ui::ListItemSpacing::Sparse)
+                                        .start_slot(
+                                            Icon::new(IconName::HistoryRerun).color(Color::Muted),
+                                        )
+                                        .child(Label::new(command.clone()).truncate_start())
+                                        .end_slot(
+                                            h_flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .child(
+                                                    Label::new("Use")
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        ("ssh-command-delete", ix),
+                                                        IconName::Trash,
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .tooltip(Tooltip::text(
+                                                        "Delete saved command",
+                                                    ))
+                                                    .on_click(cx.listener({
+                                                        let connection = connection.clone();
+                                                        move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.confirm_remove_saved_connection(
+                                                                connection.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    })),
+                                                ),
+                                        )
+                                        .on_click(cx.listener({
+                                            let command = command.clone();
+                                            move |this, _, window, cx| {
+                                                this.set_command_text(&command, window, cx);
+                                            }
+                                        }))
+                                        .into_any_element()
+                                }),
+                        ),
+                    ),
+            )
+        };
+
+        let input_section = match input_mode {
+            CreateRemoteServerInputMode::Form => form_fields.into_any_element(),
+            CreateRemoteServerInputMode::Command => v_flex()
+                .gap_0p5()
+                .child(
+                    Label::new("SSH command")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(state.address_editor.clone())
+                .when_some(command_history_section, |this, section| this.child(section))
+                .into_any_element(),
+        };
+
+        let connect_button = Button::new("ssh-connect-button", "Connect")
+            .on_click(cx.listener(|this, _, window, cx| {
+                let state = match &this.mode {
+                    Mode::CreateRemoteServer(state) => state.snapshot(),
+                    _ => return,
+                };
+                if state.ssh_prompt.is_some() {
+                    return;
+                }
+                match state.input_mode {
+                    CreateRemoteServerInputMode::Form => {
+                        this.create_ssh_server_from_form(&state, window, cx);
+                    }
+                    CreateRemoteServerInputMode::Command => {
+                        this.create_ssh_server(&state, window, cx);
+                    }
+                }
+            }))
+            .disabled(state.ssh_prompt.is_some() || state._creating.is_some());
+
+        let save_button = Button::new("ssh-save-button", "Save")
+            .on_click(cx.listener(|this, _, _window, cx| {
+                let state = match &this.mode {
+                    Mode::CreateRemoteServer(state) => state.snapshot(),
+                    _ => return,
+                };
+                if state.ssh_prompt.is_some() {
+                    return;
+                }
+
+                match state.input_mode {
+                    CreateRemoteServerInputMode::Form => {
+                        let connection_options =
+                            match this.build_ssh_connection_from_form(&state, cx) {
+                                Ok(options) => options,
+                                Err(errors) => {
+                                    let mut new_state =
+                                        state.rebuild_with(None, None, None, Some(errors));
+                                    if !new_state.form_errors.port_forwards.is_empty() {
+                                        new_state.show_advanced = true;
+                                    }
+                                    this.mode = Mode::CreateRemoteServer(new_state);
+                                    return;
+                                }
+                            };
+                        this.save_ssh_connection_options(connection_options, cx);
+                        this.show_save_toast("Saved SSH connection.", cx);
+                    }
+                    CreateRemoteServerInputMode::Command => {
+                        let input = get_text(&state.address_editor, cx);
+                        if input.is_empty() {
+                            let new_state = state.rebuild_with(
+                                Some("Enter an SSH command to save.".into()),
+                                None,
+                                None,
+                                Some(CreateRemoteServerFormErrors::default()),
+                            );
+                            this.mode = Mode::CreateRemoteServer(new_state);
+                            return;
+                        }
+                        let connection_options = match SshConnectionOptions::parse_command_line(&input)
+                        {
+                            Ok(options) => options,
+                            Err(error) => {
+                                let new_state = state.rebuild_with(
+                                    Some(format!("could not parse: {:?}", error).into()),
+                                    None,
+                                    None,
+                                    Some(CreateRemoteServerFormErrors::default()),
+                                );
+                                this.mode = Mode::CreateRemoteServer(new_state);
+                                return;
+                            }
+                        };
+                        this.save_ssh_connection_options(connection_options, cx);
+                        this.show_save_toast("Saved SSH command.", cx);
+                    }
+                }
+            }))
+            .disabled(state.ssh_prompt.is_some() || state._creating.is_some());
 
         v_flex()
             .track_focus(&self.focus_handle(cx))
@@ -1914,10 +3694,20 @@ impl RemoteServerProjects {
                     .p_2()
                     .border_b_1()
                     .border_color(theme.colors().border_variant)
-                    .child(state.address_editor.clone()),
+                    .child(mode_toggle)
+                    .child(div().h(rems_from_px(4.)))
+                    .child(input_section)
+                    .child(
+                        h_flex()
+                            .pt_2()
+                            .justify_end()
+                            .gap_1()
+                            .child(save_button)
+                            .child(connect_button),
+                    ),
             )
             .child(
-                h_flex()
+                v_flex()
                     .bg(theme.colors().editor_background)
                     .rounded_b_sm()
                     .w_full()
@@ -1933,14 +3723,243 @@ impl RemoteServerProjects {
                                 ),
                             )
                         } else {
-                            this.child(
+                            this.when(show_quick_pick, |this| {
+                                let mut section = v_flex().p_2().gap_1();
+                                if read_ssh_config {
+                                    section = section.child(
+                                        Label::new("SSH config hosts")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    );
+                                    if ssh_config_hosts.is_empty() {
+                                        section = section.child(
+                                            Label::new("No SSH config hosts found.")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        );
+                                    } else {
+                                    section = section.child(
+                                        List::new().children(
+                                            ssh_config_hosts
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(ix, host)| {
+                                                    ListItem::new(("ssh-config-host", ix))
+                                                        .inset(true)
+                                                        .spacing(ui::ListItemSpacing::Sparse)
+                                                        .start_slot(
+                                                            Icon::new(IconName::Server)
+                                                                .color(Color::Muted),
+                                                        )
+                                                        .child(
+                                                            Label::new(host.clone())
+                                                                .truncate_start(),
+                                                        )
+                                                        .end_slot(
+                                                            Label::new("Use")
+                                                                .size(LabelSize::Small)
+                                                                .color(Color::Muted),
+                                                        )
+                                                        .on_click(cx.listener({
+                                                            let host = host.clone();
+                                                            move |this, _, window, cx| {
+                                                                this.use_ssh_config_host(
+                                                                    host.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        }))
+                                                        .into_any_element()
+                                                }),
+                                        ),
+                                    );
+                                    }
+                                } else {
+                                    section = section.child(
+                                        Label::new(
+                                            "SSH config import is disabled in settings.",
+                                        )
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    );
+                                }
+                                section = section.child(
+                                    h_flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            Label::new("Saved connections")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .child(
+                                                    IconButton::new(
+                                                        "ssh-saved-delete-all",
+                                                        IconName::Trash,
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Error)
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .tooltip(Tooltip::text(
+                                                        "Delete all saved connections",
+                                                    ))
+                                                    .disabled(saved_connections_total == 0)
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.confirm_remove_all_saved_connections(
+                                                            window, cx,
+                                                        );
+                                                    })),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        "ssh-saved-toggle",
+                                                        if state.show_saved_connections {
+                                                            IconName::ChevronDown
+                                                        } else {
+                                                            IconName::ChevronRight
+                                                        },
+                                                    )
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .tooltip(Tooltip::text(
+                                                        if state.show_saved_connections {
+                                                            "Collapse saved connections"
+                                                        } else {
+                                                            "Show saved connections"
+                                                        },
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        if let Mode::CreateRemoteServer(state) =
+                                                            &mut this.mode
+                                                        {
+                                                            state.show_saved_connections =
+                                                                !state.show_saved_connections;
+                                                            cx.notify();
+                                                        }
+                                                    })),
+                                                ),
+                                        ),
+                                );
+                                if state.show_saved_connections {
+                                    if visible_saved_connections.is_empty() {
+                                        section = section.child(
+                                            Label::new("No saved connections yet.")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        );
+                                    } else {
+                                        section = section.child(
+                                            List::new().children(
+                                                visible_saved_connections
+                                                    .iter()
+                                                    .enumerate()
+                                                    .map(|(ix, connection)| {
+                                                        let connection_string =
+                                                            SshConnectionOptions::from(
+                                                                connection.clone(),
+                                                            )
+                                                            .connection_string();
+                                                        let label = if let Some(nickname) =
+                                                            connection.nickname.clone()
+                                                        {
+                                                            SharedString::from(format!(
+                                                                "{} ({})",
+                                                                nickname, connection_string
+                                                            ))
+                                                        } else {
+                                                            SharedString::from(connection_string)
+                                                        };
+                                                        ListItem::new(("ssh-saved-connection", ix))
+                                                            .inset(true)
+                                                            .spacing(ui::ListItemSpacing::Sparse)
+                                                            .start_slot(
+                                                                Icon::new(IconName::HistoryRerun)
+                                                                    .color(Color::Muted),
+                                                            )
+                                                            .child(
+                                                                Label::new(label)
+                                                                    .truncate_start(),
+                                                            )
+                                                            .end_slot(
+                                                                h_flex()
+                                                                    .gap_1()
+                                                                    .items_center()
+                                                                    .child(
+                                                                        Label::new("Use")
+                                                                            .size(LabelSize::Small)
+                                                                            .color(Color::Muted),
+                                                                    )
+                                                                .child(
+                                                                    IconButton::new(
+                                                                        ("ssh-saved-delete", ix),
+                                                                        IconName::Trash,
+                                                                    )
+                                                                    .icon_size(IconSize::XSmall)
+                                                                    .icon_color(Color::Muted)
+                                                                    .shape(IconButtonShape::Square)
+                                                                    .size(ButtonSize::Compact)
+                                                                    .tooltip(Tooltip::text(
+                                                                        "Delete saved connection",
+                                                                    ))
+                                                                    .on_click(cx.listener({
+                                                                        let connection =
+                                                                            connection.clone();
+                                                                        move |this, _, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.confirm_remove_saved_connection(
+                                                                                connection.clone(),
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                        }
+                                                                    })),
+                                                                ),
+                                                            )
+                                                            .on_click(cx.listener({
+                                                                let connection = connection.clone();
+                                                                move |this, _, window, cx| {
+                                                                    this.apply_saved_connection(
+                                                                        connection.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                }
+                                                            }))
+                                                            .into_any_element()
+                                                    }),
+                                            ),
+                                        );
+                                        if saved_connections_truncated {
+                                            section = section.child(
+                                                Label::new(format!(
+                                                    "Showing {} of {} saved connections.",
+                                                    visible_saved_connections.len(),
+                                                    saved_connections_total
+                                                ))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                            );
+                                        }
+                                    }
+                                }
+                                this.child(section).child(ListSeparator)
+                            })
+                            .child(
                                 h_flex()
                                     .p_2()
                                     .w_full()
                                     .gap_1()
                                     .child(
                                         Label::new(
-                                            "Enter the command you use to SSH into this server.",
+                                            "Pick a host from your SSH config, use the form, or paste an SSH command.",
                                         )
                                         .color(Color::Muted)
                                         .size(LabelSize::Small),
@@ -1960,6 +3979,26 @@ impl RemoteServerProjects {
                         }
                     }),
             )
+    }
+
+    fn add_ssh_server_with_index(
+        &mut self,
+        connection_options: remote::SshConnectionOptions,
+        cx: &mut Context<Self>,
+    ) -> SshServerIndex {
+        let new_ix = Arc::new(AtomicUsize::new(0));
+        let update_new_ix = new_ix.clone();
+        self.update_settings_file(cx, move |settings, _| {
+            update_new_ix.store(
+                settings
+                    .ssh_connections
+                    .as_ref()
+                    .map_or(0, |connections| connections.len()),
+                atomic::Ordering::Release,
+            );
+        });
+        self.add_ssh_server(connection_options, cx);
+        SshServerIndex(new_ix.load(atomic::Ordering::Acquire))
     }
 
     #[cfg(target_os = "windows")]
@@ -2454,6 +4493,21 @@ impl RemoteServerProjects {
                 cx.notify();
             }));
 
+        let has_open_project = self
+            .workspace
+            .upgrade()
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .is_some()
+            })
+            .unwrap_or(false);
+        let dev_container_disabled = !has_open_project;
+
         let connect_dev_container_button = div()
             .id("connect-new-dev-container")
             .track_focus(&state.add_new_devcontainer.focus_handle)
@@ -2466,18 +4520,30 @@ impl RemoteServerProjects {
                             .focus_handle
                             .contains_focused(window, cx),
                     )
+                    .disabled(dev_container_disabled)
                     .inset(true)
                     .spacing(ui::ListItemSpacing::Sparse)
                     .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
                     .child(Label::new("Connect Dev Container"))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .when(dev_container_disabled, |this| {
+                        this.tooltip(Tooltip::text(
+                            "Open a project to create a dev container.",
+                        ))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if dev_container_disabled {
+                            return;
+                        }
                         let state = CreateRemoteDevContainer::new(window, cx);
                         this.mode = Mode::CreateRemoteDevContainer(state);
 
                         cx.notify();
                     })),
             )
-            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+            .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                if dev_container_disabled {
+                    return;
+                }
                 let state = CreateRemoteDevContainer::new(window, cx);
                 this.mode = Mode::CreateRemoteDevContainer(state);
 
@@ -2510,20 +4576,6 @@ impl RemoteServerProjects {
                 cx.notify();
             }));
 
-        let has_open_project = self
-            .workspace
-            .upgrade()
-            .map(|workspace| {
-                workspace
-                    .read(cx)
-                    .project()
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .next()
-                    .is_some()
-            })
-            .unwrap_or(false);
-
         let modal_section = v_flex()
             .track_focus(&self.focus_handle(cx))
             .id("ssh-server-list")
@@ -2531,9 +4583,7 @@ impl RemoteServerProjects {
             .track_scroll(&state.scroll_handle)
             .size_full()
             .child(connect_button)
-            .when(has_open_project, |this| {
-                this.child(connect_dev_container_button)
-            });
+            .child(connect_dev_container_button);
 
         #[cfg(target_os = "windows")]
         let modal_section = modal_section.child(wsl_connect_button);
@@ -2691,6 +4741,8 @@ fn spawn_ssh_config_watch(fs: Arc<dyn Fs>, cx: &Context<RemoteServerProjects>) -
     cx.spawn(async move |remote_server_projects, cx| {
         let mut global_hosts = BTreeSet::default();
         let mut user_hosts = BTreeSet::default();
+        let mut global_entries: HashMap<String, SshConfigEntry> = HashMap::new();
+        let mut user_entries: HashMap<String, SshConfigEntry> = HashMap::new();
         let mut running_receivers = 2;
 
         loop {
@@ -2699,8 +4751,14 @@ fn spawn_ssh_config_watch(fs: Arc<dyn Fs>, cx: &Context<RemoteServerProjects>) -
                     match new_global_file_contents {
                         Some(new_global_file_contents) => {
                             global_hosts = parse_ssh_config_hosts(&new_global_file_contents);
+                            global_entries = parse_ssh_config_entries(&new_global_file_contents);
                             if remote_server_projects.update(cx, |remote_server_projects, cx| {
+                                let mut merged_entries = global_entries.clone();
+                                for (host, entry) in &user_entries {
+                                    merged_entries.insert(host.clone(), entry.clone());
+                                }
                                 remote_server_projects.ssh_config_servers = global_hosts.iter().chain(user_hosts.iter()).map(SharedString::from).collect();
+                                remote_server_projects.ssh_config_entries = merged_entries;
                                 cx.notify();
                             }).is_err() {
                                 return;
@@ -2718,8 +4776,14 @@ fn spawn_ssh_config_watch(fs: Arc<dyn Fs>, cx: &Context<RemoteServerProjects>) -
                     match new_user_file_contents {
                         Some(new_user_file_contents) => {
                             user_hosts = parse_ssh_config_hosts(&new_user_file_contents);
+                            user_entries = parse_ssh_config_entries(&new_user_file_contents);
                             if remote_server_projects.update(cx, |remote_server_projects, cx| {
+                                let mut merged_entries = global_entries.clone();
+                                for (host, entry) in &user_entries {
+                                    merged_entries.insert(host.clone(), entry.clone());
+                                }
                                 remote_server_projects.ssh_config_servers = global_hosts.iter().chain(user_hosts.iter()).map(SharedString::from).collect();
+                                remote_server_projects.ssh_config_entries = merged_entries;
                                 cx.notify();
                             }).is_err() {
                                 return;
@@ -2740,6 +4804,37 @@ fn spawn_ssh_config_watch(fs: Arc<dyn Fs>, cx: &Context<RemoteServerProjects>) -
 
 fn get_text(element: &Entity<Editor>, cx: &mut App) -> String {
     element.read(cx).text(cx).trim().to_string()
+}
+
+fn split_user_host(value: &str) -> Option<(String, String)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (user, host) = value.rsplit_once('@')?;
+    if user.is_empty() || host.is_empty() {
+        return None;
+    }
+    Some((user.to_string(), host.to_string()))
+}
+
+fn parse_port_forwards(input: &str) -> (Vec<SshPortForwardOption>, Vec<SharedString>) {
+    let mut forwards = Vec::new();
+    let mut errors = Vec::new();
+    for (index, raw) in input.split(|c| c == ',' || c == '\n' || c == ';').enumerate() {
+        let spec = raw.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let spec = spec.strip_prefix("-L").unwrap_or(spec).trim();
+        match parse_port_forward_spec(spec) {
+            Ok(option) => forwards.push(option),
+            Err(err) => {
+                errors.push(format!("Port forward {}: {err}", index + 1).into());
+            }
+        }
+    }
+    (forwards, errors)
 }
 
 impl ModalView for RemoteServerProjects {}
@@ -2779,9 +4874,11 @@ impl Render for RemoteServerProjects {
                     .render_view_options(state.clone(), window, cx)
                     .into_any_element(),
                 Mode::ProjectPicker(element) => element.clone().into_any_element(),
-                Mode::CreateRemoteServer(state) => self
-                    .render_create_remote_server(state, window, cx)
-                    .into_any_element(),
+                Mode::CreateRemoteServer(state) => {
+                    let snapshot = state.snapshot();
+                    self.render_create_remote_server(snapshot, window, cx)
+                        .into_any_element()
+                }
                 Mode::CreateRemoteDevContainer(state) => self
                     .render_create_dev_container(state, window, cx)
                     .into_any_element(),

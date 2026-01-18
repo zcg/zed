@@ -1250,12 +1250,16 @@ impl SshSocket {
 }
 
 fn parse_port_number(port_str: &str) -> Result<u16> {
-    port_str
+    let port = port_str
         .parse()
-        .with_context(|| format!("parsing port number: {port_str}"))
+        .with_context(|| format!("parsing port number: {port_str}"))?;
+    if port == 0 {
+        anyhow::bail!("port must be between 1 and 65535");
+    }
+    Ok(port)
 }
 
-fn parse_port_forward_spec(spec: &str) -> Result<SshPortForwardOption> {
+pub fn parse_port_forward_spec(spec: &str) -> Result<SshPortForwardOption> {
     let parts: Vec<&str> = spec.split(':').collect();
 
     match parts.len() {
@@ -1281,7 +1285,9 @@ fn parse_port_forward_spec(spec: &str) -> Result<SshPortForwardOption> {
                 remote_port,
             })
         }
-        _ => anyhow::bail!("Invalid port forward format"),
+        _ => anyhow::bail!(
+            "Invalid port forward format (expected local_port:remote_host:remote_port or local_host:local_port:remote_host:remote_port)"
+        ),
     }
 }
 
