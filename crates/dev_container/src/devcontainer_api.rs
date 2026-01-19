@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::Display,
     path::{Path, PathBuf},
     sync::Arc,
@@ -180,6 +180,7 @@ pub async fn start_dev_container(
                 name: project_name,
                 container_id: container_id,
                 use_podman,
+                projects: BTreeSet::new(),
             };
 
             Ok((connection, remote_workspace_folder))

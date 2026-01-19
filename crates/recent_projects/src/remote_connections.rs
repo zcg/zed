@@ -24,7 +24,9 @@ use remote::{
 };
 use semver::Version;
 pub use settings::SshConnection;
-use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
+use settings::{
+    DevContainerConnection, ExtendingVec, RegisterSetting, RemoteProject, Settings, WslConnection,
+};
 use theme::ThemeSettings;
 use ui::{
     ActiveTheme, Color, CommonAnimationExt, Context, InteractiveElement, IntoElement, KeyBinding,
@@ -37,6 +39,7 @@ use workspace::{AppState, ModalView, Workspace};
 pub struct RemoteSettings {
     pub ssh_connections: ExtendingVec<SshConnection>,
     pub wsl_connections: ExtendingVec<WslConnection>,
+    pub dev_container_connections: ExtendingVec<DevContainerConnection>,
     /// Whether to read ~/.ssh/config for ssh connection sources.
     pub read_ssh_config: bool,
 }
@@ -48,6 +51,10 @@ impl RemoteSettings {
 
     pub fn wsl_connections(&self) -> impl Iterator<Item = WslConnection> + use<> {
         self.wsl_connections.clone().0.into_iter()
+    }
+
+    pub fn dev_container_connections(&self) -> impl Iterator<Item = DevContainerConnection> + use<> {
+        self.dev_container_connections.clone().0.into_iter()
     }
 
     pub fn fill_connection_options_from_settings(&self, options: &mut SshConnectionOptions) {
@@ -118,15 +125,54 @@ impl From<WslConnection> for Connection {
     }
 }
 
+impl From<DevContainerConnection> for Connection {
+    fn from(val: DevContainerConnection) -> Self {
+        Connection::DevContainer(val)
+    }
+}
+
 impl Settings for RemoteSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let remote = &content.remote;
         Self {
             ssh_connections: remote.ssh_connections.clone().unwrap_or_default().into(),
             wsl_connections: remote.wsl_connections.clone().unwrap_or_default().into(),
+            dev_container_connections: remote
+                .dev_container_connections
+                .clone()
+                .unwrap_or_default()
+                .into(),
             read_ssh_config: remote.read_ssh_config.unwrap(),
         }
     }
+}
+
+pub(crate) fn upsert_dev_container_connection(
+    connections: &mut Vec<DevContainerConnection>,
+    connection: DevContainerConnection,
+    starting_dir: String,
+) {
+    if let Some(existing) = connections.iter_mut().find(|existing| {
+        existing.container_id == connection.container_id
+            && existing.use_podman == connection.use_podman
+    }) {
+        existing.name = connection.name.clone();
+        existing
+            .projects
+            .insert(RemoteProject { paths: vec![starting_dir] });
+        return;
+    }
+
+    connections.retain(|existing| {
+        existing.container_id != connection.container_id
+            || existing.use_podman != connection.use_podman
+    });
+
+    let mut entry = connection;
+    entry
+        .projects
+        .insert(RemoteProject { paths: vec![starting_dir] });
+    connections.insert(0, entry);
 }
 
 pub struct RemoteConnectionPrompt {

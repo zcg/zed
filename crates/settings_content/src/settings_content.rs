@@ -987,6 +987,8 @@ pub struct DevContainerConnection {
     pub name: String,
     pub container_id: String,
     pub use_podman: bool,
+    #[serde(default)]
+    pub projects: BTreeSet<RemoteProject>,
 }
 
 #[with_fallible_options]
@@ -1023,7 +1025,7 @@ pub struct WslConnection {
 
 #[with_fallible_options]
 #[derive(
-    Clone, Debug, Default, Serialize, PartialEq, Eq, PartialOrd, Ord, Deserialize, JsonSchema,
+    Clone, Debug, Default, Serialize, PartialEq, Eq, PartialOrd, Ord, Deserialize, JsonSchema, Hash,
 )]
 pub struct RemoteProject {
     pub paths: Vec<String>,

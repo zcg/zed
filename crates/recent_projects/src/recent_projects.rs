@@ -11,7 +11,10 @@ mod wsl_picker;
 
 use dev_container::start_dev_container;
 use remote::RemoteConnectionOptions;
-pub use remote_connections::{RemoteConnectionModal, connect, open_remote_project};
+pub use remote_connections::{
+    RemoteConnectionModal, connect, open_remote_project,
+};
+use remote_connections::upsert_dev_container_connection;
 
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy::{StringMatch, StringMatchCandidate};
@@ -238,9 +241,9 @@ pub fn init(cx: &mut App) {
             let replace_window = window.window_handle().downcast::<Workspace>();
 
             cx.spawn_in(window, async move |_, mut cx| {
-                let (connection, starting_dir) =
+                let (dev_connection, starting_dir) =
                     match start_dev_container(&mut cx, app_state.node_runtime.clone()).await {
-                        Ok((c, s)) => (Connection::DevContainer(c), s),
+                        Ok((c, s)) => (c, s),
                         Err(e) => {
                             log::error!("Failed to start Dev Container: {:?}", e);
                             cx.prompt(
@@ -254,6 +257,27 @@ pub fn init(cx: &mut App) {
                             return;
                         }
                     };
+                let connection = Connection::DevContainer(dev_connection.clone());
+                let starting_dir_for_settings = starting_dir.clone();
+
+                cx.update(|_, cx| {
+                    use gpui::ReadGlobal;
+                    use settings::SettingsStore;
+
+                    let fs = app_state.fs.clone();
+                    SettingsStore::global(cx).update_settings_file(fs, move |setting, _| {
+                        let connections = setting
+                            .remote
+                            .dev_container_connections
+                            .get_or_insert(Default::default());
+                        upsert_dev_container_connection(
+                            connections,
+                            dev_connection,
+                            starting_dir_for_settings.clone(),
+                        );
+                    });
+                })
+                .ok();
 
                 let result = open_remote_project(
                     connection.into(),
