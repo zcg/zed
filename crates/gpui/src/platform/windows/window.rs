@@ -1009,12 +1009,15 @@ impl PlatformWindow for WindowsWindow {
     #[cfg(target_os = "windows")]
     fn merge_into_tabbing_group(&self, target_identifier: String, target_hwnd: HWND) {
         // Register this window into the target group.
-        self.0.set_tabbing_identifier(Some(target_identifier.clone()));
+        self.0
+            .set_tabbing_identifier(Some(target_identifier.clone()));
 
         // Hide and position this window so it behaves like a "tab" under the target window.
-        self.0
-            .tab_coordinator
-            .absorb_window_into_group(&target_identifier, target_hwnd, self.0.hwnd);
+        self.0.tab_coordinator.absorb_window_into_group(
+            &target_identifier,
+            target_hwnd,
+            self.0.hwnd,
+        );
     }
 
     fn tab_bar_visible(&self) -> bool {

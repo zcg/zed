@@ -9,9 +9,9 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, GetWindowRect, IsIconic, IsWindow, IsZoomed, SetWindowPos, ShowWindow,
-    WINDOWPLACEMENT, SW_HIDE, SW_MAXIMIZE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW,
+    GetWindowPlacement, GetWindowRect, IsIconic, IsWindow, IsZoomed, SW_HIDE, SW_MAXIMIZE, SW_SHOW,
+    SW_SHOWNA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
+    WINDOWPLACEMENT,
 };
 
 /// Coordinates windows that are visually grouped as tabs.

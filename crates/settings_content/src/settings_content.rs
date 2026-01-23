@@ -989,6 +989,26 @@ pub struct DevContainerConnection {
     pub use_podman: bool,
     #[serde(default)]
     pub projects: BTreeSet<RemoteProject>,
+    #[serde(default)]
+    pub host_projects: BTreeSet<RemoteProject>,
+    pub host: Option<DevContainerHost>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DevContainerHost {
+    Ssh {
+        host: String,
+        username: Option<String>,
+        port: Option<u16>,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    Wsl {
+        distro_name: String,
+        user: Option<String>,
+    },
 }
 
 #[with_fallible_options]

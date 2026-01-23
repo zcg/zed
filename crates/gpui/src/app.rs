@@ -594,8 +594,11 @@ impl SystemWindowTabController {
 
         let initial_tabs_len = initial_tabs.len();
         let mut all_tabs = initial_tabs.clone();
-        let initial_tab_ids: FxHashSet<WindowId> =
-            all_tabs.iter().take(initial_tabs_len).map(|tab| tab.id).collect();
+        let initial_tab_ids: FxHashSet<WindowId> = all_tabs
+            .iter()
+            .take(initial_tabs_len)
+            .map(|tab| tab.id)
+            .collect();
 
         for (_, mut tabs) in controller.tab_groups.drain() {
             // Compare by `WindowId` instead of full `SystemWindowTab` equality, since titles and

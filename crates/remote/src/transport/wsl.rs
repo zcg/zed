@@ -85,6 +85,7 @@ impl WslRemoteConnection {
             .await
             .context("failed detecting shell")?;
         log::info!("Remote shell discovered: {}", this.shell);
+        this.default_system_shell = this.shell.clone();
         this.shell_kind = ShellKind::new(&this.shell, false);
         this.has_wsl_interop = this.detect_has_wsl_interop().await.unwrap_or_default();
         log::info!(
@@ -118,8 +119,11 @@ impl WslRemoteConnection {
 
     async fn detect_shell(&self) -> Result<String> {
         const DEFAULT_SHELL: &str = "sh";
+        // Prefer bash if available; fall back to sh if not.
+        const SHELL_PROBE: &str =
+            "if command -v bash >/dev/null 2>&1; then command -v bash; else echo /bin/sh; fi";
         match self
-            .run_wsl_command_with_output("sh", &["-c", "echo $SHELL"])
+            .run_wsl_command_with_output("sh", &["-c", SHELL_PROBE])
             .await
         {
             Ok(output) => Ok(parse_shell(&output, DEFAULT_SHELL)),
@@ -192,27 +196,35 @@ impl WslRemoteConnection {
             .is_ok();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        if let Some(remote_server_path) = super::build_remote_server_from_source(
+        match super::build_remote_server_from_source(
             &self.platform,
             delegate.as_ref(),
             binary_exists_on_server,
             cx,
         )
-        .await?
+        .await
         {
-            let tmp_path = paths::remote_wsl_server_dir_relative().join(
-                &RelPath::unix(&format!(
-                    "download-{}-{}",
-                    std::process::id(),
-                    remote_server_path.file_name().unwrap().to_string_lossy()
-                ))
-                .unwrap(),
-            );
-            self.upload_file(&remote_server_path, &tmp_path, delegate, cx)
-                .await?;
-            self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
-                .await?;
-            return Ok(dst_path);
+            Ok(Some(remote_server_path)) => {
+                let tmp_path = paths::remote_wsl_server_dir_relative().join(
+                    &RelPath::unix(&format!(
+                        "download-{}-{}",
+                        std::process::id(),
+                        remote_server_path.file_name().unwrap().to_string_lossy()
+                    ))
+                    .unwrap(),
+                );
+                self.upload_file(&remote_server_path, &tmp_path, delegate, cx)
+                    .await?;
+                self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
+                    .await?;
+                return Ok(dst_path);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!(
+                    "Failed to build remote server from source, falling back to download: {err:#}",
+                );
+            }
         }
 
         if binary_exists_on_server {

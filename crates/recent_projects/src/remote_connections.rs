@@ -25,7 +25,8 @@ use remote::{
 use semver::Version;
 pub use settings::SshConnection;
 use settings::{
-    DevContainerConnection, ExtendingVec, RegisterSetting, RemoteProject, Settings, WslConnection,
+    DevContainerConnection, DevContainerHost, ExtendingVec, RegisterSetting, RemoteProject,
+    Settings, WslConnection,
 };
 use theme::ThemeSettings;
 use ui::{
@@ -53,7 +54,9 @@ impl RemoteSettings {
         self.wsl_connections.clone().0.into_iter()
     }
 
-    pub fn dev_container_connections(&self) -> impl Iterator<Item = DevContainerConnection> + use<> {
+    pub fn dev_container_connections(
+        &self,
+    ) -> impl Iterator<Item = DevContainerConnection> + use<> {
         self.dev_container_connections.clone().0.into_iter()
     }
 
@@ -102,11 +105,33 @@ impl From<Connection> for RemoteConnectionOptions {
             Connection::Ssh(conn) => RemoteConnectionOptions::Ssh(conn.into()),
             Connection::Wsl(conn) => RemoteConnectionOptions::Wsl(conn.into()),
             Connection::DevContainer(conn) => {
+                let host = conn.host.as_ref().map(|host| match host {
+                    DevContainerHost::Ssh {
+                        host,
+                        username,
+                        port,
+                        args,
+                    } => remote::DockerHost::Ssh(SshConnectionOptions {
+                        host: host.clone().into(),
+                        username: username.clone(),
+                        port: *port,
+                        args: Some(args.clone()),
+                        ..Default::default()
+                    }),
+                    DevContainerHost::Wsl { distro_name, user } => {
+                        remote::DockerHost::Wsl(remote::WslConnectionOptions {
+                            distro_name: distro_name.clone(),
+                            user: user.clone(),
+                        })
+                    }
+                });
+
                 RemoteConnectionOptions::Docker(DockerConnectionOptions {
                     name: conn.name,
                     container_id: conn.container_id,
                     upload_binary_over_docker_exec: false,
                     use_podman: conn.use_podman,
+                    host: host.unwrap_or(remote::DockerHost::Local),
                 })
             }
         }
@@ -151,27 +176,40 @@ pub(crate) fn upsert_dev_container_connection(
     connections: &mut Vec<DevContainerConnection>,
     connection: DevContainerConnection,
     starting_dir: String,
+    host_starting_dir: Option<String>,
 ) {
     if let Some(existing) = connections.iter_mut().find(|existing| {
         existing.container_id == connection.container_id
             && existing.use_podman == connection.use_podman
+            && existing.host == connection.host
     }) {
         existing.name = connection.name.clone();
-        existing
-            .projects
-            .insert(RemoteProject { paths: vec![starting_dir] });
+        existing.projects.insert(RemoteProject {
+            paths: vec![starting_dir],
+        });
+        if let Some(host_starting_dir) = host_starting_dir {
+            existing.host_projects.insert(RemoteProject {
+                paths: vec![host_starting_dir],
+            });
+        }
         return;
     }
 
     connections.retain(|existing| {
         existing.container_id != connection.container_id
             || existing.use_podman != connection.use_podman
+            || existing.host != connection.host
     });
 
     let mut entry = connection;
-    entry
-        .projects
-        .insert(RemoteProject { paths: vec![starting_dir] });
+    entry.projects.insert(RemoteProject {
+        paths: vec![starting_dir],
+    });
+    if let Some(host_starting_dir) = host_starting_dir {
+        entry.host_projects.insert(RemoteProject {
+            paths: vec![host_starting_dir],
+        });
+    }
     connections.insert(0, entry);
 }
 

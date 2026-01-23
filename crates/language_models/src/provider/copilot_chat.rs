@@ -12,6 +12,7 @@ use copilot_chat::{
     Function, FunctionContent, ImageUrl, Model as CopilotChatModel, ModelVendor,
     Request as CopilotChatRequest, ResponseEvent, Tool, ToolCall, ToolCallContent, ToolChoice,
 };
+use edit_prediction::EditPredictionStore;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt};
@@ -30,7 +31,6 @@ use settings::SettingsStore;
 use ui::prelude::*;
 use util::debug_panic;
 use workspace::Workspace;
-use edit_prediction::EditPredictionStore;
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("copilot_chat");
 const PROVIDER_NAME: LanguageModelProviderName =
@@ -180,18 +180,17 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        let copilot = window
-            .root::<Workspace>()
-            .flatten()
-            .and_then(|workspace| {
-                let (project, app_state) = {
-                    let workspace = workspace.read(cx);
-                    (workspace.project().clone(), workspace.app_state().clone())
-                };
-                let ep_store =
-                    EditPredictionStore::global(&app_state.client, &app_state.user_store, cx);
-                ep_store.update(cx, |store, cx| store.start_copilot_for_project(&project, cx))
-            });
+        let copilot = window.root::<Workspace>().flatten().and_then(|workspace| {
+            let (project, app_state) = {
+                let workspace = workspace.read(cx);
+                (workspace.project().clone(), workspace.app_state().clone())
+            };
+            let ep_store =
+                EditPredictionStore::global(&app_state.client, &app_state.user_store, cx);
+            ep_store.update(cx, |store, cx| {
+                store.start_copilot_for_project(&project, cx)
+            })
+        });
 
         cx.new(move |cx| {
             copilot_ui::ConfigurationView::new(

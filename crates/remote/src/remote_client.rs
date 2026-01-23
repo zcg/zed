@@ -1013,6 +1013,33 @@ impl RemoteClient {
         })
     }
 
+    /// Disconnects from the remote server without attempting to reconnect.
+    /// If `server_not_running` is true, the disconnection is treated as a server stop.
+    pub fn disconnect(
+        &mut self,
+        server_not_running: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(connection) = self.remote_connection() else {
+            return Task::ready(Err(anyhow!("no active remote connection to disconnect")));
+        };
+
+        // Drop any in-flight tasks before forcing a disconnected state.
+        self.state.take();
+
+        let state = if server_not_running {
+            State::ServerNotRunning
+        } else {
+            State::ReconnectExhausted
+        };
+        self.set_state(state, cx);
+
+        cx.spawn(async move |_, _| {
+            connection.kill().await?;
+            Ok(())
+        })
+    }
+
     /// Simulates a timeout by pausing heartbeat responses.
     /// This will cause heartbeat failures and eventually trigger reconnection
     /// after MAX_MISSED_HEARTBEATS are missed.

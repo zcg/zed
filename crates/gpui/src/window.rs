@@ -1111,7 +1111,10 @@ impl Window {
             app_id,
             window_min_size,
             window_decorations,
-            #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_variables))]
+            #[cfg_attr(
+                not(any(target_os = "macos", target_os = "windows")),
+                allow(unused_variables)
+            )]
             tabbing_identifier,
         } = options;
 
@@ -1219,9 +1222,7 @@ impl Window {
                             .ok();
                     })
                 } else if needs_present {
-                    handle
-                        .update(&mut cx, |_, window, _| window.present())
-                        .ok();
+                    handle.update(&mut cx, |_, window, _| window.present()).ok();
                 }
 
                 handle
@@ -1363,7 +1364,10 @@ impl Window {
                     cx.spawn(async move |cx| {
                         handle
                             .update(cx, |_, _window, cx| {
-                                SystemWindowTabController::merge_all_windows(cx, handle.window_id());
+                                SystemWindowTabController::merge_all_windows(
+                                    cx,
+                                    handle.window_id(),
+                                );
                                 SystemWindowTabController::refresh_all_windows(cx);
                             })
                             .log_err();
@@ -4831,11 +4835,7 @@ impl Window {
     /// This makes the current window behave like a "tab" under the target window by adopting its
     /// tabbing identifier and then hiding/positioning it underneath the target.
     #[cfg(target_os = "windows")]
-    pub fn merge_into_tabbing_group(
-        &self,
-        target_identifier: String,
-        target_hwnd: crate::HWND,
-    ) {
+    pub fn merge_into_tabbing_group(&self, target_identifier: String, target_hwnd: crate::HWND) {
         self.platform_window
             .merge_into_tabbing_group(target_identifier, target_hwnd)
     }

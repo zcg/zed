@@ -579,7 +579,7 @@ impl SshRemoteConnection {
 
         let (ssh_path_style, ssh_default_system_shell) = match ssh_platform.os {
             RemoteOs::Windows => (PathStyle::Windows, ssh_shell.clone()),
-            _ => (PathStyle::Posix, String::from("/bin/sh")),
+            _ => (PathStyle::Posix, ssh_shell.clone()),
         };
 
         let mut this = Self {
@@ -640,27 +640,38 @@ impl SshRemoteConnection {
             .is_ok();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        if let Some(remote_server_path) = super::build_remote_server_from_source(
+        match super::build_remote_server_from_source(
             &self.ssh_platform,
             delegate.as_ref(),
             binary_exists_on_server,
             cx,
         )
-        .await?
+        .await
         {
-            let tmp_path = paths::remote_server_dir_relative().join(
-                RelPath::unix(&format!(
-                    "download-{}-{}",
-                    std::process::id(),
-                    remote_server_path.file_name().unwrap().to_string_lossy()
-                ))
-                .unwrap(),
-            );
-            self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
-                .await?;
-            self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
-                .await?;
-            return Ok(dst_path);
+            Ok(Some(remote_server_path)) => {
+                let tmp_path = paths::remote_server_dir_relative().join(
+                    RelPath::unix(&format!(
+                        "download-{}-{}",
+                        std::process::id(),
+                        remote_server_path.file_name().unwrap().to_string_lossy()
+                    ))
+                    .unwrap(),
+                );
+                self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
+                    .await?;
+                self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+                    .await?;
+                return Ok(dst_path);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                if matches!(release_channel, ReleaseChannel::Dev) {
+                    return Err(err);
+                }
+                log::warn!(
+                    "Failed to build remote server from source, falling back to download: {err:#}",
+                );
+            }
         }
 
         if binary_exists_on_server {
@@ -669,12 +680,10 @@ impl SshRemoteConnection {
 
         let wanted_version = cx.update(|cx| match release_channel {
             ReleaseChannel::Nightly => Ok(None),
-            ReleaseChannel::Dev => {
-                anyhow::bail!(
-                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
-                    dst_path
-                )
-            }
+            ReleaseChannel::Dev => anyhow::bail!(
+                "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
+                dst_path
+            ),
             _ => Ok(Some(AppVersion::global(cx))),
         })?;
 
@@ -1234,8 +1243,11 @@ impl SshSocket {
 
     async fn shell_posix(&self) -> String {
         const DEFAULT_SHELL: &str = "sh";
+        // Prefer bash if available; fall back to sh if not.
+        const SHELL_PROBE: &str =
+            "if command -v bash >/dev/null 2>&1; then command -v bash; else echo /bin/sh; fi";
         match self
-            .run_command(ShellKind::Posix, "sh", &["-c", "echo $SHELL"], false)
+            .run_command(ShellKind::Posix, "sh", &["-c", SHELL_PROBE], false)
             .await
         {
             Ok(output) => parse_shell(&output, DEFAULT_SHELL),

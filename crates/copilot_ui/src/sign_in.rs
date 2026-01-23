@@ -327,15 +327,14 @@ impl CopilotCodeVerification {
                                                     .ok()
                                                     .flatten();
                                                 if let Some(value) = result {
-                                                    if let Ok(status) =
-                                                        serde_json::from_value::<
-                                                            request::SignInStatus,
-                                                        >(value)
-                                                    {
+                                                    if let Ok(status) = serde_json::from_value::<
+                                                        request::SignInStatus,
+                                                    >(
+                                                        value
+                                                    ) {
                                                         copilot_clone.update(cx, |copilot, cx| {
-                                                            copilot.update_sign_in_status(
-                                                                status, cx,
-                                                            );
+                                                            copilot
+                                                                .update_sign_in_status(status, cx);
                                                         });
                                                     }
                                                 }
@@ -753,9 +752,6 @@ impl Render for ConfigurationView {
     }
 }
 
-fn resolve_copilot(
-    copilot: Option<Entity<Copilot>>,
-    cx: &App,
-) -> Option<Entity<Copilot>> {
+fn resolve_copilot(copilot: Option<Entity<Copilot>>, cx: &App) -> Option<Entity<Copilot>> {
     copilot.or_else(|| Copilot::global(cx))
 }

@@ -11,10 +11,9 @@ mod wsl_picker;
 
 use dev_container::start_dev_container;
 use remote::RemoteConnectionOptions;
-pub use remote_connections::{
-    RemoteConnectionModal, connect, open_remote_project,
-};
+use remote::WslConnectionOptions;
 use remote_connections::upsert_dev_container_connection;
+pub use remote_connections::{RemoteConnectionModal, connect, open_remote_project};
 
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy::{StringMatch, StringMatchCandidate};
@@ -29,8 +28,69 @@ use picker::{
 };
 pub use remote_connections::RemoteSettings;
 pub use remote_servers::RemoteServerProjects;
-use settings::Settings;
+use settings::{DevContainerConnection, DevContainerHost, Settings};
 use std::{path::Path, sync::Arc};
+
+async fn normalize_host_starting_dir(
+    connection: &DevContainerConnection,
+    host_starting_dir: Option<String>,
+) -> Option<String> {
+    let Some(path) = host_starting_dir else {
+        return None;
+    };
+    let Some(DevContainerHost::Wsl { distro_name, user }) = connection.host.as_ref() else {
+        return Some(path);
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        if path.starts_with('/') {
+            return Some(path);
+        }
+        if let Some(wsl_path) = wsl_unc_path_to_posix(&path, distro_name) {
+            return Some(wsl_path);
+        }
+        let options = WslConnectionOptions {
+            distro_name: distro_name.clone(),
+            user: user.clone(),
+        };
+        match options.abs_windows_path_to_wsl_path(Path::new(&path)).await {
+            Ok(wsl_path) => Some(wsl_path),
+            Err(err) => {
+                log::warn!("Failed to convert host path to WSL path: {err:#}");
+                Some(path)
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(path)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_unc_path_to_posix(path: &str, distro_name: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let prefixes = [
+        format!("\\\\wsl$\\\\{distro_name}"),
+        format!("\\\\wsl.localhost\\\\{distro_name}"),
+        format!("//wsl$/{distro_name}"),
+        format!("//wsl.localhost/{distro_name}"),
+    ];
+    for prefix in prefixes {
+        if path.starts_with(&prefix) {
+            let mut rest = &path[prefix.len()..];
+            rest = rest.strip_prefix('\\').unwrap_or(rest);
+            rest = rest.strip_prefix('/').unwrap_or(rest);
+            let mut converted = rest.replace('\\', "/");
+            if !converted.starts_with('/') {
+                converted.insert(0, '/');
+            }
+            return Some(converted);
+        }
+    }
+    None
+}
 use ui::{KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*, tooltip_container};
 use util::{ResultExt, paths::PathExt};
 use workspace::{
@@ -240,6 +300,12 @@ pub fn init(cx: &mut App) {
             let app_state = workspace.app_state().clone();
             let replace_window = window.window_handle().downcast::<Workspace>();
 
+            let host_starting_dir = workspace
+                .project()
+                .read(cx)
+                .active_project_directory(cx)
+                .map(|dir| dir.display().to_string());
+
             cx.spawn_in(window, async move |_, mut cx| {
                 let (dev_connection, starting_dir) =
                     match start_dev_container(&mut cx, app_state.node_runtime.clone()).await {
@@ -258,6 +324,8 @@ pub fn init(cx: &mut App) {
                         }
                     };
                 let connection = Connection::DevContainer(dev_connection.clone());
+                let host_starting_dir =
+                    normalize_host_starting_dir(&dev_connection, host_starting_dir).await;
                 let starting_dir_for_settings = starting_dir.clone();
 
                 cx.update(|_, cx| {
@@ -274,6 +342,7 @@ pub fn init(cx: &mut App) {
                             connections,
                             dev_connection,
                             starting_dir_for_settings.clone(),
+                            host_starting_dir.clone(),
                         );
                     });
                 })

@@ -1,8 +1,8 @@
 use settings::{Settings, SettingsStore};
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, Context, Hsla, InteractiveElement, MouseButton,
-    DragMoveEvent, ParentElement, ScrollHandle, Styled, SystemWindowTab, SystemWindowTabController,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, DragMoveEvent, Hsla, InteractiveElement,
+    MouseButton, ParentElement, ScrollHandle, Styled, SystemWindowTab, SystemWindowTabController,
     Window, WindowId, actions, canvas, div, point, size,
 };
 
@@ -91,20 +91,20 @@ impl SystemWindowTabs {
             cx.windows().iter().for_each(|handle| {
                 handle
                     .update(cx, |_, window, cx| {
-                    window.set_tabbing_identifier(tabbing_identifier.clone());
-                    if use_system_window_tabs {
-                        let tabs = if let Some(tabs) = window.tabbed_windows() {
-                            tabs
-                        } else {
-                            vec![SystemWindowTab::new(
-                                SharedString::from(window.window_title()),
-                                window.window_handle(),
-                            )]
-                        };
+                        window.set_tabbing_identifier(tabbing_identifier.clone());
+                        if use_system_window_tabs {
+                            let tabs = if let Some(tabs) = window.tabbed_windows() {
+                                tabs
+                            } else {
+                                vec![SystemWindowTab::new(
+                                    SharedString::from(window.window_title()),
+                                    window.window_handle(),
+                                )]
+                            };
 
-                        SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
-                    }
-                })
+                            SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
+                        }
+                    })
                     .ok();
             });
         })
@@ -257,7 +257,13 @@ impl SystemWindowTabs {
                             .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == dragged_tab.id));
 
                         if same_group {
-                            Self::handle_tab_drop(dragged_tab, tab_ix, target_window_id, window, cx);
+                            Self::handle_tab_drop(
+                                dragged_tab,
+                                tab_ix,
+                                target_window_id,
+                                window,
+                                cx,
+                            );
                         } else {
                             let dragged_tab = dragged_tab.clone();
                             cx.defer(move |cx| {
@@ -319,10 +325,8 @@ impl SystemWindowTabs {
                                         } else {
                                             item.handle
                                                 .update(cx, |_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(CloseWindow),
-                                                        cx,
-                                                    );
+                                                    window
+                                                        .dispatch_action(Box::new(CloseWindow), cx);
                                                 })
                                                 .ok();
                                         }
@@ -488,7 +492,10 @@ impl SystemWindowTabs {
 
         let Ok((target_identifier, target_hwnd)) =
             target_handle.update(cx, |_, target_window, _| {
-                (target_window.tabbing_identifier(), target_window.raw_handle())
+                (
+                    target_window.tabbing_identifier(),
+                    target_window.raw_handle(),
+                )
             })
         else {
             return;
@@ -515,7 +522,8 @@ impl SystemWindowTabs {
         }
 
         // Snapshot the target group after the platform coordinator updates.
-        let Ok(tabs) = target_handle.update(cx, |_, target_window, _| target_window.tabbed_windows())
+        let Ok(tabs) =
+            target_handle.update(cx, |_, target_window, _| target_window.tabbed_windows())
         else {
             return;
         };
@@ -549,7 +557,9 @@ impl SystemWindowTabs {
 
     #[cfg(target_os = "windows")]
     fn refresh_window_ids(cx: &mut App, window_ids: impl IntoIterator<Item = WindowId>) {
-        let ids = window_ids.into_iter().collect::<std::collections::HashSet<_>>();
+        let ids = window_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
         for handle in cx.windows() {
             if ids.contains(&handle.window_id()) {
                 handle.update(cx, |_, window, _| window.refresh()).ok();
@@ -670,82 +680,84 @@ impl Render for SystemWindowTabs {
         #[cfg(target_os = "windows")]
         let tab_bar = tab_bar.on_drag_move::<DraggedWindowTab>(cx.listener(
             |this, event: &DragMoveEvent<DraggedWindowTab>, window, cx| {
-                    let Some(dragged_tab) = event.dragged_item().downcast_ref::<DraggedWindowTab>()
+                let Some(dragged_tab) = event.dragged_item().downcast_ref::<DraggedWindowTab>()
+                else {
+                    return;
+                };
+
+                let global_pos = window.bounds().origin + event.event.position;
+                let mut next_preview: Option<SystemWindowTabDragPreview> = None;
+
+                // Prefer top-most windows when multiple overlap.
+                let windows = cx.window_stack().unwrap_or_else(|| cx.windows());
+                for handle in windows {
+                    let Ok((target_window_id, bounds)) =
+                        handle.update(cx, |_, target_window, _| {
+                            (
+                                target_window.window_handle().window_id(),
+                                target_window.bounds(),
+                            )
+                        })
                     else {
-                        return;
+                        continue;
                     };
 
-                    let global_pos = window.bounds().origin + event.event.position;
-                    let mut next_preview: Option<SystemWindowTabDragPreview> = None;
+                    // Only preview within the window tab bar area.
+                    // On Windows, `PlatformTitleBar::height` is currently fixed at 32px.
+                    let tab_bar_bounds = Bounds::new(
+                        point(bounds.origin.x, bounds.origin.y + px(32.)),
+                        size(bounds.size.width, Tab::container_height(cx)),
+                    );
 
-                    // Prefer top-most windows when multiple overlap.
-                    let windows = cx.window_stack().unwrap_or_else(|| cx.windows());
-                    for handle in windows {
-                        let Ok((target_window_id, bounds)) =
-                            handle.update(cx, |_, target_window, _| {
-                                (target_window.window_handle().window_id(), target_window.bounds())
-                            })
-                        else {
-                            continue;
-                        };
-
-                        // Only preview within the window tab bar area.
-                        // On Windows, `PlatformTitleBar::height` is currently fixed at 32px.
-                        let tab_bar_bounds = Bounds::new(
-                            point(bounds.origin.x, bounds.origin.y + px(32.)),
-                            size(bounds.size.width, Tab::container_height(cx)),
-                        );
-
-                        if !tab_bar_bounds.contains(&global_pos) {
-                            continue;
-                        }
-
-                        let (tab_width, scroll_offset_x, tab_count) = {
-                            let controller = cx.global::<SystemWindowTabController>();
-                            let tab_count = controller
-                                .tabs(target_window_id)
-                                .map(|tabs| tabs.len())
-                                .unwrap_or(1);
-                            let metrics = controller.tab_bar_metrics(target_window_id).copied();
-                            let tab_width = metrics.map(|m| m.tab_width).unwrap_or(px(0.));
-                            let scroll_offset_x =
-                                metrics.map(|m| m.scroll_offset_x).unwrap_or(px(0.));
-                            (tab_width, scroll_offset_x, tab_count)
-                        };
-
-                        let insert_ix = if tab_width > px(0.) {
-                            let local_x = (global_pos.x - bounds.origin.x) + scroll_offset_x;
-                            ((local_x / tab_width).floor() as usize).min(tab_count)
-                        } else {
-                            tab_count
-                        };
-
-                        next_preview = Some(SystemWindowTabDragPreview {
-                            target_window_id,
-                            insert_ix,
-                        });
-                        break;
+                    if !tab_bar_bounds.contains(&global_pos) {
+                        continue;
                     }
 
-                    let previous = cx.global::<SystemWindowTabController>().drag_preview();
-                    if SystemWindowTabController::set_drag_preview(cx, next_preview) {
-                        // Only refresh windows that could visually change (previous target, new target,
-                        // and the source window rendering the drag).
-                        let mut to_refresh = Vec::new();
-                        if let Some(prev) = previous {
-                            to_refresh.push(prev.target_window_id);
-                        }
-                        if let Some(next) = next_preview {
-                            to_refresh.push(next.target_window_id);
-                        }
-                        to_refresh.push(window.window_handle().window_id());
-                        Self::refresh_window_ids(cx, to_refresh);
-                    }
+                    let (tab_width, scroll_offset_x, tab_count) = {
+                        let controller = cx.global::<SystemWindowTabController>();
+                        let tab_count = controller
+                            .tabs(target_window_id)
+                            .map(|tabs| tabs.len())
+                            .unwrap_or(1);
+                        let metrics = controller.tab_bar_metrics(target_window_id).copied();
+                        let tab_width = metrics.map(|m| m.tab_width).unwrap_or(px(0.));
+                        let scroll_offset_x = metrics.map(|m| m.scroll_offset_x).unwrap_or(px(0.));
+                        (tab_width, scroll_offset_x, tab_count)
+                    };
 
-                    // `on_mouse_up_out` uses this to decide whether to detach.
-                    if this.last_dragged_tab.is_none() {
-                        this.last_dragged_tab = Some(dragged_tab.clone());
+                    let insert_ix = if tab_width > px(0.) {
+                        let local_x = (global_pos.x - bounds.origin.x) + scroll_offset_x;
+                        ((local_x / tab_width).floor() as usize).min(tab_count)
+                    } else {
+                        tab_count
+                    };
+
+                    next_preview = Some(SystemWindowTabDragPreview {
+                        target_window_id,
+                        insert_ix,
+                    });
+                    break;
+                }
+
+                let previous = cx.global::<SystemWindowTabController>().drag_preview();
+                if SystemWindowTabController::set_drag_preview(cx, next_preview) {
+                    // Only refresh windows that could visually change (previous target, new target,
+                    // and the source window rendering the drag).
+                    let mut to_refresh = Vec::new();
+                    if let Some(prev) = previous {
+                        to_refresh.push(prev.target_window_id);
                     }
+                    if let Some(next) = next_preview {
+                        to_refresh.push(next.target_window_id);
+                    }
+                    to_refresh.push(window.window_handle().window_id());
+                    Self::refresh_window_ids(cx, to_refresh);
+                }
+
+                // `on_mouse_up_out` uses this to decide whether to detach.
+                if this.last_dragged_tab.is_none() {
+                    this.last_dragged_tab = Some(dragged_tab.clone());
+                }
             },
         ));
 
@@ -816,7 +828,9 @@ impl Render for SystemWindowTabs {
                                 let same_group = cx
                                     .global::<SystemWindowTabController>()
                                     .tabs(target_window_id)
-                                    .is_some_and(|tabs| tabs.iter().any(|tab| tab.id == dragged_tab.id));
+                                    .is_some_and(|tabs| {
+                                        tabs.iter().any(|tab| tab.id == dragged_tab.id)
+                                    });
 
                                 if same_group {
                                     Self::handle_tab_drop(
@@ -842,7 +856,13 @@ impl Render for SystemWindowTabs {
                             }
 
                             #[cfg(not(target_os = "windows"))]
-                            Self::handle_tab_drop(dragged_tab, usize::MAX, target_window_id, window, cx);
+                            Self::handle_tab_drop(
+                                dragged_tab,
+                                usize::MAX,
+                                target_window_id,
+                                window,
+                                cx,
+                            );
                         })
                     })
                     .overflow_x_scroll()

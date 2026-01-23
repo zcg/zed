@@ -272,7 +272,8 @@ impl WindowsWindowInner {
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
         // If this window is part of a tab group, ensure another window becomes visible
         if let Some(identifier) = self.tabbing_identifier() {
-            self.tab_coordinator.handle_window_destroyed(&identifier, handle);
+            self.tab_coordinator
+                .handle_window_destroyed(&identifier, handle);
         }
 
         let callback = { self.state.callbacks.close.take() };

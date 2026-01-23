@@ -24,7 +24,8 @@ use project::{
 
 use language::{LanguageName, Toolchain, ToolchainScope};
 use remote::{
-    DockerConnectionOptions, RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
+    DockerConnectionOptions, DockerHost, RemoteConnectionOptions, SshConnectionOptions,
+    WslConnectionOptions,
 };
 use serde::{Deserialize, Serialize};
 use sqlez::{
@@ -1328,7 +1329,19 @@ impl WorkspaceDb {
                 kind = RemoteConnectionKind::Docker;
                 container_id = Some(options.container_id);
                 name = Some(options.name);
-                use_podman = Some(options.use_podman)
+                use_podman = Some(options.use_podman);
+                match options.host {
+                    DockerHost::Ssh(options) => {
+                        host = Some(options.host.to_string());
+                        port = options.port;
+                        user = options.username;
+                    }
+                    DockerHost::Wsl(options) => {
+                        distro = Some(options.distro_name);
+                        user = options.user;
+                    }
+                    DockerHost::Local => {}
+                }
             }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => {
@@ -1558,11 +1571,28 @@ impl WorkspaceDb {
                 ..Default::default()
             })),
             RemoteConnectionKind::Docker => {
+                let host = if let Some(distro) = distro {
+                    DockerHost::Wsl(WslConnectionOptions {
+                        distro_name: distro,
+                        user,
+                    })
+                } else if let Some(host) = host {
+                    DockerHost::Ssh(SshConnectionOptions {
+                        host: host.into(),
+                        port,
+                        username: user,
+                        ..Default::default()
+                    })
+                } else {
+                    DockerHost::Local
+                };
+
                 Some(RemoteConnectionOptions::Docker(DockerConnectionOptions {
                     container_id: container_id?,
                     name: name?,
                     upload_binary_over_docker_exec: false,
                     use_podman: use_podman?,
+                    host,
                 }))
             }
         }

@@ -482,18 +482,18 @@ pub fn initialize_workspace(
                         let mut group_workspace_windows = Vec::new();
                         for tab in tabs {
                             if let Some(workspace_window) = tab.handle.downcast::<Workspace>() {
-                                if !group_workspace_windows
-                                    .iter()
-                                    .any(|existing: &gpui::WindowHandle<Workspace>| {
+                                if !group_workspace_windows.iter().any(
+                                    |existing: &gpui::WindowHandle<Workspace>| {
                                         existing.window_id() == workspace_window.window_id()
-                                    })
-                                {
+                                    },
+                                ) {
                                     group_workspace_windows.push(workspace_window);
                                 }
                             }
                         }
 
-                        if group_workspace_windows.len() <= 1 || current_workspace_window.is_none() {
+                        if group_workspace_windows.len() <= 1 || current_workspace_window.is_none()
+                        {
                             return handle
                                 .update(cx, |workspace, cx| {
                                     workspace.close_window(&CloseWindow, window, cx);
@@ -527,8 +527,7 @@ pub fn initialize_workspace(
 
                             match choice {
                                 0 => {
-                                    if let Some(current_workspace_window) =
-                                        current_workspace_window
+                                    if let Some(current_workspace_window) = current_workspace_window
                                     {
                                         current_workspace_window
                                             .update(cx, |workspace, window, cx| {

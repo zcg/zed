@@ -129,7 +129,10 @@ fn parse_hosts_from(line: &str, hosts: &mut BTreeSet<String>) {
 }
 
 fn parse_hosts_from_line(line: &str) -> Vec<String> {
-    let line = line.split_once('#').map(|(before, _)| before).unwrap_or(line);
+    let line = line
+        .split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(line);
     line.split_whitespace()
         .filter(|field| !field.starts_with('!'))
         .filter(|field| !field.contains('*'))
@@ -145,12 +148,7 @@ fn strip_prefix_keyword<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     }
     let (head, tail) = value.split_at(prefix.len());
     if head.eq_ignore_ascii_case(prefix) {
-        if tail.is_empty()
-            || tail
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace())
-        {
+        if tail.is_empty() || tail.chars().next().is_some_and(|c| c.is_whitespace()) {
             Some(tail)
         } else {
             None

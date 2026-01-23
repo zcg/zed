@@ -453,19 +453,17 @@ impl PickerDelegate for OpenPathDelegate {
                         let new_state = match &this.delegate.directory_state {
                             DirectoryState::None { create: false }
                             | DirectoryState::List { .. } => match paths {
-                                Ok(paths) => {
-                                    DirectoryState::List {
-                                        entries: path_candidates(
-                                            parent_path_is_root,
-                                            &dir,
-                                            this.delegate.path_style,
-                                            this.delegate.mode,
-                                            paths,
-                                        ),
-                                        parent_path: dir.clone(),
-                                        error: None,
-                                    }
-                                }
+                                Ok(paths) => DirectoryState::List {
+                                    entries: path_candidates(
+                                        parent_path_is_root,
+                                        &dir,
+                                        this.delegate.path_style,
+                                        this.delegate.mode,
+                                        paths,
+                                    ),
+                                    parent_path: dir.clone(),
+                                    error: None,
+                                },
                                 Err(e) => DirectoryState::List {
                                     entries: Vec::new(),
                                     parent_path: dir.clone(),
@@ -573,7 +571,10 @@ impl PickerDelegate for OpenPathDelegate {
                     .read_with(cx, |picker, _| !picker.delegate.browsing_directories())
                     .unwrap_or(true);
 
-                if should_prepend_with_current_dir && !current_dir_in_new_entries && allow_current_dir {
+                if should_prepend_with_current_dir
+                    && !current_dir_in_new_entries
+                    && allow_current_dir
+                {
                     new_entries.insert(
                         0,
                         CandidateInfo {
@@ -794,17 +795,17 @@ impl PickerDelegate for OpenPathDelegate {
                         CandidateKind::Root => PathBuf::from(self.prompt_root.clone()),
                         CandidateKind::Parent => {
                             let normalized_parent = self.normalize_path_string(parent_path);
-                            let normalized_parent = normalized_parent
-                                .trim_end_matches(self.path_style.separators_ch());
+                            let normalized_parent =
+                                normalized_parent.trim_end_matches(self.path_style.separators_ch());
                             let parent = Path::new(normalized_parent)
                                 .parent()
                                 .map(|path| path.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| self.prompt_root.clone());
                             PathBuf::from(self.normalize_path_string(&parent))
                         }
-                        CandidateKind::Entry => {
-                            PathBuf::from(self.normalize_join_path(parent_path, &candidate.path.string))
-                        }
+                        CandidateKind::Entry => PathBuf::from(
+                            self.normalize_join_path(parent_path, &candidate.path.string),
+                        ),
                     }
                 } else {
                     match candidate.kind {
@@ -816,7 +817,8 @@ impl PickerDelegate for OpenPathDelegate {
                             self.path_style.primary_separator()
                         )),
                         CandidateKind::Entry => {
-                            if parent_path == &self.prompt_root && candidate.path.string.is_empty() {
+                            if parent_path == &self.prompt_root && candidate.path.string.is_empty()
+                            {
                                 PathBuf::from(&self.prompt_root)
                             } else {
                                 Path::new(self.lister.resolve_tilde(parent_path, cx).as_ref())
@@ -965,10 +967,9 @@ impl PickerDelegate for OpenPathDelegate {
                 let (label, indices) = match candidate.kind {
                     CandidateKind::Parent => ("Parent directory".to_string(), match_positions),
                     CandidateKind::Home => ("Home (~)".to_string(), match_positions),
-                    CandidateKind::Root => (
-                        format!("Root ({})", self.prompt_root),
-                        match_positions,
-                    ),
+                    CandidateKind::Root => {
+                        (format!("Root ({})", self.prompt_root), match_positions)
+                    }
                     CandidateKind::Entry => {
                         if is_current_dir_candidate {
                             ("open this directory".to_string(), vec![])
@@ -1101,7 +1102,7 @@ impl PickerDelegate for OpenPathDelegate {
                 Label::new(format!(
                     "{primary} browse dir, {secondary} choose dir, {primary} choose file"
                 ))
-                    .color(Color::Muted),
+                .color(Color::Muted),
             )
             .into_any_element();
 
@@ -1126,8 +1127,11 @@ impl PickerDelegate for OpenPathDelegate {
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         if self.browsing_directories() {
             Arc::from(
-                format!("[path{}]type to filter", self.path_style.primary_separator())
-                    .as_str(),
+                format!(
+                    "[path{}]type to filter",
+                    self.path_style.primary_separator()
+                )
+                .as_str(),
             )
         } else {
             Arc::from(

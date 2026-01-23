@@ -6,34 +6,40 @@ use crate::{
     },
     ssh_config::{SshConfigEntry, parse_ssh_config_entries, parse_ssh_config_hosts},
 };
-use dev_container::start_dev_container;
+use dev_container::{
+    DevContainerBuildStep, DevContainerLogLine, DevContainerLogStream, DevContainerProgressEvent,
+    start_dev_container_with_progress,
+};
 use editor::{Editor, EditorEvent};
 use file_finder::OpenPathDelegate;
-use futures::{FutureExt, channel::oneshot, future::Shared, select};
+use futures::{
+    FutureExt, StreamExt as _,
+    channel::{mpsc, oneshot},
+    future::Shared,
+    select,
+};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, PromptLevel, ScrollHandle, Subscription, Task, WeakEntity, Window,
-    canvas,
-    FutureExt as _,
+    FocusHandle, Focusable, FutureExt as _, PathPromptOptions, PromptLevel, ScrollHandle,
+    Subscription, Task, WeakEntity, Window, canvas,
 };
-use language::Point;
+use language::{Point, language_settings::SoftWrap};
 use log::info;
 use paths::{global_ssh_config_file, user_ssh_config_file};
 use picker::Picker;
 use project::{Fs, Project};
 use remote::{
-    RemoteClient, RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
+    DockerHost, RemoteClient, RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
     parse_port_forward_spec, remote_client::ConnectionIdentifier,
 };
 use settings::{
-    DevContainerConnection, RemoteProject, RemoteSettingsContent, Settings as _, SettingsStore,
-    SshPortForwardOption, update_settings_file, watch_config_file,
+    DevContainerConnection, DevContainerHost, RemoteProject, RemoteSettingsContent, Settings as _,
+    SettingsStore, SshPortForwardOption, update_settings_file, watch_config_file,
 };
-use smol::stream::StreamExt as _;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc,
@@ -42,15 +48,17 @@ use std::{
     time::Duration,
 };
 use ui::{
-    CommonAnimationExt, ContextMenu, IconButtonShape, KeyBinding, List,
-    ListItem, ListSeparator, Modal, ModalHeader, Navigable, NavigableEntry, PopoverMenu, Section,
-    ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar,
-    prelude::*,
+    ButtonStyle, Callout, CommonAnimationExt, ContextMenu, CopyButton, IconButtonShape, KeyBinding,
+    List, ListItem, ListSeparator, Modal, ModalHeader, Navigable, NavigableEntry, PopoverMenu,
+    Section, TintColor, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt,
+    command::new_smol_command,
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
+    shell::ShellKind,
 };
 use workspace::{
     ModalView, OpenOptions, Toast, Workspace,
@@ -92,6 +100,8 @@ pub struct RemoteServerProjects {
 
 const START_PROXY_TIMEOUT: Duration = Duration::from_secs(90);
 const START_PROXY_TIMEOUT_WITH_BUILD: Duration = Duration::from_secs(6 * 60);
+const DEV_CONTAINER_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+const DEV_CONTAINER_PROBE_CONCURRENCY: usize = 6;
 const SAVED_CONNECTIONS_LIMIT: usize = 5;
 const REMOTE_SERVERS_PAGE_SIZE: usize = 5;
 
@@ -316,7 +326,176 @@ impl CreateRemoteServer {
 enum DevContainerCreationProgress {
     Initial,
     Creating,
+    Success,
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DevContainerStepStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+struct DevContainerUiStep {
+    label: SharedString,
+    status: DevContainerStepStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DevContainerBuildStatus {
+    Running,
+    Success,
+    Failed,
+}
+
+#[derive(Clone)]
+struct DevContainerBuildState {
+    steps: [DevContainerUiStep; 3],
+    prepare_completed: usize,
+    selected_step: usize,
+    status: DevContainerBuildStatus,
+    log_editor: Entity<Editor>,
+    log_contents: String,
+    back_entry: NavigableEntry,
+    close_entry: NavigableEntry,
+    copy_entry: NavigableEntry,
+    finish_entry: NavigableEntry,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DevContainerKey {
+    container_id: String,
+    use_podman: bool,
+    host: Option<DevContainerHost>,
+}
+
+impl DevContainerKey {
+    fn from_connection(connection: &DevContainerConnection) -> Self {
+        Self {
+            container_id: connection.container_id.clone(),
+            use_podman: connection.use_podman,
+            host: connection.host.clone(),
+        }
+    }
+}
+
+fn dev_container_key_from_remote_options(
+    options: &RemoteConnectionOptions,
+) -> Option<DevContainerKey> {
+    let RemoteConnectionOptions::Docker(options) = options else {
+        return None;
+    };
+
+    let host = match &options.host {
+        DockerHost::Local => None,
+        DockerHost::Wsl(options) => Some(DevContainerHost::Wsl {
+            distro_name: options.distro_name.clone(),
+            user: options.user.clone(),
+        }),
+        DockerHost::Ssh(options) => Some(DevContainerHost::Ssh {
+            host: options.host.to_string(),
+            username: options.username.clone(),
+            port: options.port,
+            args: options.args.clone().unwrap_or_default(),
+        }),
+    };
+
+    Some(DevContainerKey {
+        container_id: options.container_id.clone(),
+        use_podman: options.use_podman,
+        host,
+    })
+}
+
+fn devcontainer_error_hints(message: &str) -> Vec<String> {
+    let mut hints = Vec::new();
+    let message_lower = message.to_ascii_lowercase();
+
+    let push_hint = |hint: &str, hints: &mut Vec<String>| {
+        if !hints.iter().any(|existing| existing == hint) {
+            hints.push(hint.to_string());
+        }
+    };
+
+    if message.contains("Dev Container CLI not available")
+        || message_lower.contains("devcontainer cli")
+    {
+        push_hint(
+            "Install the Dev Container CLI on the project host (WSL/SSH): npm install -g @devcontainers/cli",
+            &mut hints,
+        );
+        push_hint("Verify it is on PATH: devcontainer --version", &mut hints);
+        push_hint(
+            "Quick WSL check: wsl -d <distro> -- sh -lc 'command -v devcontainer'",
+            &mut hints,
+        );
+        push_hint(
+            "Ensure PATH is set for login shells (e.g. ~/.bash_profile, ~/.profile, ~/.zprofile).",
+            &mut hints,
+        );
+        push_hint(
+            "If using mise, add ~/.local/share/mise/bin and ~/.local/share/mise/shims to PATH in your login shell config.",
+            &mut hints,
+        );
+        push_hint(
+            "Run the commands on the host where the project lives, not on Windows.",
+            &mut hints,
+        );
+    }
+
+    if message.contains("Docker CLI not found")
+        || message_lower.contains("docker cli not available")
+        || message_lower.contains("unable to run docker")
+    {
+        push_hint(
+            "Install Docker or Podman on the project host and ensure it is on PATH.",
+            &mut hints,
+        );
+        push_hint(
+            "Verify it is available: docker --version (or podman --version).",
+            &mut hints,
+        );
+        push_hint(
+            "Run the commands on the host where the project lives, not on Windows.",
+            &mut hints,
+        );
+    }
+
+    if message.contains("No valid dev container definition") {
+        push_hint(
+            "Ensure .devcontainer/devcontainer.json exists in the project root.",
+            &mut hints,
+        );
+    }
+
+    if message.contains("Failed to parse file .devcontainer/devcontainer.json") {
+        push_hint(
+            "Fix JSON syntax errors in .devcontainer/devcontainer.json.",
+            &mut hints,
+        );
+    }
+
+    if message_lower.contains("failed to download the remote server binary")
+        || message_lower.contains("cannot upload local files to a container over ssh")
+        || message_lower.contains("uploading a local binary over ssh is not supported")
+    {
+        push_hint(
+            "Ensure the container has outbound internet access and curl or wget installed.",
+            &mut hints,
+        );
+    }
+
+    if message.contains("Dev Containers are only supported for local, WSL, or SSH projects") {
+        push_hint(
+            "Open the project as Local, WSL, or SSH before creating a dev container.",
+            &mut hints,
+        );
+    }
+
+    hints
 }
 
 #[derive(Clone)]
@@ -327,6 +506,7 @@ struct CreateRemoteDevContainer {
     // - Go back
     entries: [NavigableEntry; 3],
     progress: DevContainerCreationProgress,
+    build_state: Option<DevContainerBuildState>,
 }
 
 impl CreateRemoteDevContainer {
@@ -336,12 +516,159 @@ impl CreateRemoteDevContainer {
         Self {
             entries,
             progress: DevContainerCreationProgress::Initial,
+            build_state: None,
         }
     }
 
-    fn progress(&mut self, progress: DevContainerCreationProgress) -> Self {
+    fn with_progress(
+        mut self,
+        progress: DevContainerCreationProgress,
+        window: &mut Window,
+        cx: &mut Context<RemoteServerProjects>,
+    ) -> Self {
         self.progress = progress;
-        self.clone()
+        if !matches!(self.progress, DevContainerCreationProgress::Initial)
+            && self.build_state.is_none()
+        {
+            self.build_state = Some(DevContainerBuildState::new(window, cx));
+        }
+        self
+    }
+}
+
+impl DevContainerBuildState {
+    fn step_index(step: DevContainerBuildStep) -> usize {
+        match step {
+            DevContainerBuildStep::CheckDocker | DevContainerBuildStep::CheckDevcontainerCli => 0,
+            DevContainerBuildStep::DevcontainerUp => 1,
+            DevContainerBuildStep::ReadConfiguration => 2,
+        }
+    }
+
+    fn new(window: &mut Window, cx: &mut Context<RemoteServerProjects>) -> Self {
+        let log_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_text(String::new(), window, cx);
+            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+            editor.hide_minimap_by_default(window, cx);
+            editor.set_show_line_numbers(false, cx);
+            editor.set_show_code_actions(false, cx);
+            editor.set_show_breakpoints(false, cx);
+            editor.set_show_git_diff_gutter(false, cx);
+            editor.set_show_runnables(false, cx);
+            editor.set_input_enabled(false);
+            editor.set_use_autoclose(false);
+            editor.set_read_only(true);
+            editor.set_show_edit_predictions(Some(false), window, cx);
+            editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+            editor
+        });
+
+        let steps = [
+            DevContainerUiStep {
+                label: SharedString::from("1. Environment checks"),
+                status: DevContainerStepStatus::Pending,
+            },
+            DevContainerUiStep {
+                label: SharedString::from("2. Build dev container"),
+                status: DevContainerStepStatus::Pending,
+            },
+            DevContainerUiStep {
+                label: SharedString::from("3. Read config and connect"),
+                status: DevContainerStepStatus::Pending,
+            },
+        ];
+
+        Self {
+            steps,
+            prepare_completed: 0,
+            selected_step: 0,
+            status: DevContainerBuildStatus::Running,
+            log_editor,
+            log_contents: String::new(),
+            back_entry: NavigableEntry::focusable(cx),
+            close_entry: NavigableEntry::focusable(cx),
+            copy_entry: NavigableEntry::focusable(cx),
+            finish_entry: NavigableEntry::focusable(cx),
+        }
+    }
+
+    fn start_step(&mut self, step: DevContainerBuildStep) {
+        self.selected_step = Self::step_index(step);
+        match step {
+            DevContainerBuildStep::CheckDocker | DevContainerBuildStep::CheckDevcontainerCli => {
+                self.steps[0].status = DevContainerStepStatus::Running;
+            }
+            DevContainerBuildStep::DevcontainerUp => {
+                self.steps[1].status = DevContainerStepStatus::Running;
+            }
+            DevContainerBuildStep::ReadConfiguration => {
+                self.steps[2].status = DevContainerStepStatus::Running;
+            }
+        }
+    }
+
+    fn complete_step(&mut self, step: DevContainerBuildStep) {
+        self.selected_step = Self::step_index(step);
+        match step {
+            DevContainerBuildStep::CheckDocker | DevContainerBuildStep::CheckDevcontainerCli => {
+                self.prepare_completed += 1;
+                if self.prepare_completed >= 2 {
+                    self.steps[0].status = DevContainerStepStatus::Completed;
+                }
+            }
+            DevContainerBuildStep::DevcontainerUp => {
+                self.steps[1].status = DevContainerStepStatus::Completed;
+            }
+            DevContainerBuildStep::ReadConfiguration => {
+                self.steps[2].status = DevContainerStepStatus::Completed;
+                self.status = DevContainerBuildStatus::Success;
+            }
+        }
+    }
+
+    fn fail_step(&mut self, step: DevContainerBuildStep) {
+        self.selected_step = Self::step_index(step);
+        match step {
+            DevContainerBuildStep::CheckDocker | DevContainerBuildStep::CheckDevcontainerCli => {
+                self.steps[0].status = DevContainerStepStatus::Failed;
+            }
+            DevContainerBuildStep::DevcontainerUp => {
+                self.steps[1].status = DevContainerStepStatus::Failed;
+            }
+            DevContainerBuildStep::ReadConfiguration => {
+                self.steps[2].status = DevContainerStepStatus::Failed;
+            }
+        }
+        self.status = DevContainerBuildStatus::Failed;
+    }
+
+    fn append_log_line(
+        &mut self,
+        line: DevContainerLogLine,
+        window: &mut Window,
+        cx: &mut Context<RemoteServerProjects>,
+    ) {
+        let mut formatted = match line.stream {
+            DevContainerLogStream::Info => format!("[info] {}", line.line),
+            DevContainerLogStream::Stdout => line.line,
+            DevContainerLogStream::Stderr => format!("[stderr] {}", line.line),
+        };
+        if !formatted.ends_with('\n') {
+            formatted.push('\n');
+        }
+        self.log_contents.push_str(&formatted);
+        let log_contents = self.log_contents.clone();
+        self.log_editor.update(cx, |editor, cx| {
+            editor.set_text(log_contents, window, cx);
+            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+        });
+    }
+
+    fn select_previous_step(&mut self) {
+        if self.selected_step > 0 {
+            self.selected_step -= 1;
+        }
     }
 }
 
@@ -410,6 +737,11 @@ struct EditNicknameState {
     editor: Entity<Editor>,
 }
 
+struct EditDevContainerNameState {
+    index: DevContainerIndex,
+    editor: Entity<Editor>,
+}
+
 impl EditNicknameState {
     fn new(index: SshServerIndex, window: &mut Window, cx: &mut App) -> Self {
         let this = Self {
@@ -423,6 +755,28 @@ impl EditNicknameState {
             .filter(|text| !text.is_empty());
         this.editor.update(cx, |this, cx| {
             this.set_placeholder_text("Add a nickname for this server", window, cx);
+            if let Some(starting_text) = starting_text {
+                this.set_text(starting_text, window, cx);
+            }
+        });
+        this.editor.focus_handle(cx).focus(window, cx);
+        this
+    }
+}
+
+impl EditDevContainerNameState {
+    fn new(index: DevContainerIndex, window: &mut Window, cx: &mut App) -> Self {
+        let this = Self {
+            index,
+            editor: cx.new(|cx| Editor::single_line(window, cx)),
+        };
+        let starting_text = RemoteSettings::get_global(cx)
+            .dev_container_connections()
+            .nth(index.0)
+            .map(|state| state.name)
+            .filter(|text| !text.is_empty());
+        this.editor.update(cx, |this, cx| {
+            this.set_placeholder_text("Rename this dev container", window, cx);
             if let Some(starting_text) = starting_text {
                 this.set_text(starting_text, window, cx);
             }
@@ -741,7 +1095,7 @@ impl RemoteEntry {
         matches!(
             self,
             Self::Project {
-                connection: Connection::Ssh(_) | Connection::Wsl(_),
+                connection: Connection::Ssh(_) | Connection::Wsl(_) | Connection::DevContainer(_),
                 ..
             }
         )
@@ -801,6 +1155,7 @@ enum RemoteEntryKey {
     DevContainer {
         container_id: SharedString,
         use_podman: bool,
+        host: Option<DevContainerHost>,
     },
     SshConfig(SharedString),
 }
@@ -821,6 +1176,7 @@ impl RemoteEntryKey {
                 Connection::DevContainer(connection) => Self::DevContainer {
                     container_id: SharedString::from(connection.container_id.clone()),
                     use_podman: connection.use_podman,
+                    host: connection.host.clone(),
                 },
             },
             RemoteEntry::SshConfig { host, .. } => Self::SshConfig(host.clone()),
@@ -859,6 +1215,7 @@ impl RemoteEntryKey {
                 Self::DevContainer {
                     container_id,
                     use_podman,
+                    host,
                 },
                 RemoteEntry::Project {
                     connection: Connection::DevContainer(connection),
@@ -867,10 +1224,14 @@ impl RemoteEntryKey {
             ) => {
                 container_id.as_ref() == connection.container_id.as_str()
                     && *use_podman == connection.use_podman
+                    && host == &connection.host
             }
-            (Self::SshConfig(host), RemoteEntry::SshConfig { host: entry_host, .. }) => {
-                host == entry_host
-            }
+            (
+                Self::SshConfig(host),
+                RemoteEntry::SshConfig {
+                    host: entry_host, ..
+                },
+            ) => host == entry_host,
             _ => false,
         }
     }
@@ -891,6 +1252,7 @@ struct DefaultState {
     scroll_handle: ScrollHandle,
     add_new_server: NavigableEntry,
     add_new_devcontainer: NavigableEntry,
+    refresh_devcontainer: NavigableEntry,
     add_new_wsl: NavigableEntry,
     servers: Vec<RemoteEntry>,
 }
@@ -900,6 +1262,7 @@ impl DefaultState {
         let handle = ScrollHandle::new();
         let add_new_server = NavigableEntry::new(&handle, cx);
         let add_new_devcontainer = NavigableEntry::new(&handle, cx);
+        let refresh_devcontainer = NavigableEntry::new(&handle, cx);
         let add_new_wsl = NavigableEntry::new(&handle, cx);
 
         let ssh_settings = RemoteSettings::get_global(cx);
@@ -949,27 +1312,28 @@ impl DefaultState {
                 }
             });
 
-        let dev_container_servers = ssh_settings
-            .dev_container_connections()
-            .enumerate()
-            .map(|(index, connection)| {
-                let select = NavigableEntry::new(&handle, cx);
-                let open_folder = NavigableEntry::new(&handle, cx);
-                let configure = NavigableEntry::new(&handle, cx);
-                let projects = connection
-                    .projects
-                    .iter()
-                    .map(|project| (NavigableEntry::new(&handle, cx), project.clone()))
-                    .collect();
-                RemoteEntry::Project {
-                    select,
-                    open_folder,
-                    configure,
-                    projects,
-                    index: ServerIndex::DevContainer(DevContainerIndex(index)),
-                    connection: connection.into(),
-                }
-            });
+        let dev_container_servers =
+            ssh_settings
+                .dev_container_connections()
+                .enumerate()
+                .map(|(index, connection)| {
+                    let select = NavigableEntry::new(&handle, cx);
+                    let open_folder = NavigableEntry::new(&handle, cx);
+                    let configure = NavigableEntry::new(&handle, cx);
+                    let projects = connection
+                        .projects
+                        .iter()
+                        .map(|project| (NavigableEntry::new(&handle, cx), project.clone()))
+                        .collect();
+                    RemoteEntry::Project {
+                        select,
+                        open_folder,
+                        configure,
+                        projects,
+                        index: ServerIndex::DevContainer(DevContainerIndex(index)),
+                        connection: connection.into(),
+                    }
+                });
 
         let mut servers = ssh_servers
             .chain(wsl_servers)
@@ -1000,6 +1364,7 @@ impl DefaultState {
             scroll_handle: handle,
             add_new_server,
             add_new_devcontainer,
+            refresh_devcontainer,
             add_new_wsl,
             servers,
         }
@@ -1018,6 +1383,11 @@ enum ViewServerOptionsState {
         server_index: WslServerIndex,
         entries: [NavigableEntry; 2],
     },
+    DevContainer {
+        connection: DevContainerConnection,
+        server_index: DevContainerIndex,
+        entries: [NavigableEntry; 8],
+    },
 }
 
 impl ViewServerOptionsState {
@@ -1025,6 +1395,7 @@ impl ViewServerOptionsState {
         match self {
             Self::Ssh { entries, .. } => entries,
             Self::Wsl { entries, .. } => entries,
+            Self::DevContainer { entries, .. } => entries,
         }
     }
 }
@@ -1033,6 +1404,7 @@ enum Mode {
     Default(DefaultState),
     ViewServerOptions(ViewServerOptionsState),
     EditNickname(EditNicknameState),
+    EditDevContainerName(EditDevContainerNameState),
     ProjectPicker(Entity<ProjectPicker>),
     CreateRemoteServer(CreateRemoteServer),
     CreateRemoteDevContainer(CreateRemoteDevContainer),
@@ -1092,8 +1464,11 @@ impl RemoteServerProjects {
     ) -> Self {
         Self::new_inner(
             Mode::CreateRemoteDevContainer(
-                CreateRemoteDevContainer::new(window, cx)
-                    .progress(DevContainerCreationProgress::Creating),
+                CreateRemoteDevContainer::new(window, cx).with_progress(
+                    DevContainerCreationProgress::Creating,
+                    window,
+                    cx,
+                ),
             ),
             false,
             fs,
@@ -1111,7 +1486,14 @@ impl RemoteServerProjects {
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
-            let server = Self::new(create_new_window, fs, window, workspace, cx);
+            let server = Self::new_inner(
+                Mode::default_mode(&BTreeSet::new(), cx),
+                create_new_window,
+                fs,
+                window,
+                workspace,
+                cx,
+            );
             server.focus_handle(cx).focus(window, cx);
             server
         })
@@ -1296,7 +1678,12 @@ impl RemoteServerProjects {
         this
     }
 
-    fn create_ssh_server(&mut self, state: &CreateRemoteServer, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_ssh_server(
+        &mut self,
+        state: &CreateRemoteServer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let input = get_text(&state.address_editor, cx);
         if input.is_empty() {
             return;
@@ -1355,11 +1742,7 @@ impl RemoteServerProjects {
         cx.notify();
     }
 
-    fn use_ssh_config_defaults(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn use_ssh_config_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = match &self.mode {
             Mode::CreateRemoteServer(state) => state.snapshot(),
             _ => return,
@@ -1436,7 +1819,8 @@ impl RemoteServerProjects {
             errors.host = Some("Host is required".into());
         }
 
-        let mut username = Some(get_text(&state.form.username_editor, cx)).filter(|t| !t.is_empty());
+        let mut username =
+            Some(get_text(&state.form.username_editor, cx)).filter(|t| !t.is_empty());
         if username.is_none() {
             if let Some((user, host_part)) = split_user_host(&host) {
                 username = Some(user);
@@ -1484,8 +1868,7 @@ impl RemoteServerProjects {
             errors.port_forwards = port_forward_errors;
         }
 
-        let default_nickname =
-            Self::default_ssh_nickname(&host, username.as_deref(), port);
+        let default_nickname = Self::default_ssh_nickname(&host, username.as_deref(), port);
         let mut connection_options = SshConnectionOptions {
             host: host.into(),
             username,
@@ -1547,9 +1930,7 @@ impl RemoteServerProjects {
         let connection_timeout = connection_options.connection_timeout;
 
         self.update_settings_file(cx, move |setting, _| {
-            let connections = setting
-                .ssh_connections
-                .get_or_insert(Default::default());
+            let connections = setting.ssh_connections.get_or_insert(Default::default());
             let mut entry = connections
                 .iter()
                 .find(|connection| {
@@ -1559,16 +1940,16 @@ impl RemoteServerProjects {
                 })
                 .cloned()
                 .unwrap_or_else(|| SshConnection {
-                host: host.clone(),
-                username: username.clone(),
-                port,
-                projects: BTreeSet::new(),
-                nickname: None,
-                args: Vec::new(),
-                upload_binary_over_ssh: None,
-                port_forwards: None,
-                connection_timeout: None,
-            });
+                    host: host.clone(),
+                    username: username.clone(),
+                    port,
+                    projects: BTreeSet::new(),
+                    nickname: None,
+                    args: Vec::new(),
+                    upload_binary_over_ssh: None,
+                    port_forwards: None,
+                    connection_timeout: None,
+                });
             entry.args = args.clone();
             entry.port_forwards = port_forwards.clone();
             entry.connection_timeout = connection_timeout;
@@ -1597,8 +1978,7 @@ impl RemoteServerProjects {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let connection_string =
-            SshConnectionOptions::from(connection.clone()).connection_string();
+        let connection_string = SshConnectionOptions::from(connection.clone()).connection_string();
         let prompt_message = format!("Delete saved connection `{}`?", connection_string);
         let confirmation = window.prompt(
             PromptLevel::Warning,
@@ -1722,8 +2102,10 @@ impl RemoteServerProjects {
             Self::set_editor_text(&state.form.jump_host_editor, "", window, cx);
         }
 
-        let has_port_forwards =
-            connection.port_forwards.as_ref().is_some_and(|pf| !pf.is_empty());
+        let has_port_forwards = connection
+            .port_forwards
+            .as_ref()
+            .is_some_and(|pf| !pf.is_empty());
         if let Some(port_forwards) = connection.port_forwards.as_ref() {
             let formatted = port_forwards
                 .iter()
@@ -1742,20 +2124,13 @@ impl RemoteServerProjects {
             Self::set_editor_text(&state.form.port_forwards_editor, "", window, cx);
         }
 
-        state.show_advanced = has_identity_file
-            || has_jump_host
-            || has_port_forwards;
+        state.show_advanced = has_identity_file || has_jump_host || has_port_forwards;
         state.form_errors = CreateRemoteServerFormErrors::default();
         state.address_error = None;
         cx.notify();
     }
 
-    fn set_command_text(
-        &mut self,
-        command: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_command_text(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Mode::CreateRemoteServer(state) = &mut self.mode {
             state.input_mode = CreateRemoteServerInputMode::Command;
             state.address_editor.update(cx, |editor, cx| {
@@ -1913,10 +2288,7 @@ impl RemoteServerProjects {
         if port_text.is_empty() {
             return None;
         }
-        let port = port_text
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port > 0);
+        let port = port_text.parse::<u16>().ok().filter(|port| *port > 0);
         let username = username?;
 
         let connection = SshConnectionOptions {
@@ -1981,10 +2353,8 @@ impl RemoteServerProjects {
                 match result {
                     Ok(Some((_user, bytes))) => match String::from_utf8(bytes) {
                         Ok(password) => {
-                            new_state.password_keychain_status =
-                                PasswordKeychainStatus::Saved;
-                            if auto_fill
-                                && state.form.password_editor.read(cx).text(cx).is_empty()
+                            new_state.password_keychain_status = PasswordKeychainStatus::Saved;
+                            if auto_fill && state.form.password_editor.read(cx).text(cx).is_empty()
                             {
                                 state.form.password_editor.update(cx, |editor, cx| {
                                     editor.set_text(password, window, cx);
@@ -1992,8 +2362,7 @@ impl RemoteServerProjects {
                             }
                         }
                         Err(_) => {
-                            new_state.password_keychain_status =
-                                PasswordKeychainStatus::Error;
+                            new_state.password_keychain_status = PasswordKeychainStatus::Error;
                         }
                     },
                     Ok(None) => {
@@ -2081,10 +2450,7 @@ impl RemoteServerProjects {
                         }
                         Err(_) => {
                             updated.password_keychain_status = PasswordKeychainStatus::Error;
-                            this.show_password_toast(
-                                "Saved password is not valid UTF-8.",
-                                cx,
-                            );
+                            this.show_password_toast("Saved password is not valid UTF-8.", cx);
                         }
                     },
                     Ok(None) => {
@@ -2122,27 +2488,25 @@ impl RemoteServerProjects {
         let write_task = cx.write_credentials(&url, &username, password.as_bytes());
         cx.spawn_in(window, async move |this, cx| {
             let result = write_task.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => {
-                        if let Mode::CreateRemoteServer(state) = &this.mode {
-                            let mut updated = state.rebuild_with(None, None, None, None);
-                            updated.password_keychain_status = PasswordKeychainStatus::Saved;
-                            updated.password_keychain_url = Some(url.clone());
-                            this.mode = Mode::CreateRemoteServer(updated);
-                        }
-                        this.show_password_toast("Password saved to keychain.", cx);
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    if let Mode::CreateRemoteServer(state) = &this.mode {
+                        let mut updated = state.rebuild_with(None, None, None, None);
+                        updated.password_keychain_status = PasswordKeychainStatus::Saved;
+                        updated.password_keychain_url = Some(url.clone());
+                        this.mode = Mode::CreateRemoteServer(updated);
                     }
-                    Err(error) => {
-                        log::error!("Failed to save ssh password: {error:#}");
-                        if let Mode::CreateRemoteServer(state) = &this.mode {
-                            let mut updated = state.rebuild_with(None, None, None, None);
-                            updated.password_keychain_status = PasswordKeychainStatus::Error;
-                            updated.password_keychain_url = Some(url.clone());
-                            this.mode = Mode::CreateRemoteServer(updated);
-                        }
-                        this.show_password_toast("Failed to save password.", cx);
+                    this.show_password_toast("Password saved to keychain.", cx);
+                }
+                Err(error) => {
+                    log::error!("Failed to save ssh password: {error:#}");
+                    if let Mode::CreateRemoteServer(state) = &this.mode {
+                        let mut updated = state.rebuild_with(None, None, None, None);
+                        updated.password_keychain_status = PasswordKeychainStatus::Error;
+                        updated.password_keychain_url = Some(url.clone());
+                        this.mode = Mode::CreateRemoteServer(updated);
                     }
+                    this.show_password_toast("Failed to save password.", cx);
                 }
             })
             .log_err();
@@ -2163,27 +2527,25 @@ impl RemoteServerProjects {
         let delete_task = cx.delete_credentials(&url);
         cx.spawn_in(window, async move |this, cx| {
             let result = delete_task.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => {
-                        if let Mode::CreateRemoteServer(state) = &this.mode {
-                            let mut updated = state.rebuild_with(None, None, None, None);
-                            updated.password_keychain_status = PasswordKeychainStatus::NotSaved;
-                            updated.password_keychain_url = Some(url.clone());
-                            this.mode = Mode::CreateRemoteServer(updated);
-                        }
-                        this.show_password_toast("Saved password deleted.", cx);
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    if let Mode::CreateRemoteServer(state) = &this.mode {
+                        let mut updated = state.rebuild_with(None, None, None, None);
+                        updated.password_keychain_status = PasswordKeychainStatus::NotSaved;
+                        updated.password_keychain_url = Some(url.clone());
+                        this.mode = Mode::CreateRemoteServer(updated);
                     }
-                    Err(error) => {
-                        log::error!("Failed to delete ssh password: {error:#}");
-                        if let Mode::CreateRemoteServer(state) = &this.mode {
-                            let mut updated = state.rebuild_with(None, None, None, None);
-                            updated.password_keychain_status = PasswordKeychainStatus::Error;
-                            updated.password_keychain_url = Some(url.clone());
-                            this.mode = Mode::CreateRemoteServer(updated);
-                        }
-                        this.show_password_toast("Failed to delete saved password.", cx);
+                    this.show_password_toast("Saved password deleted.", cx);
+                }
+                Err(error) => {
+                    log::error!("Failed to delete ssh password: {error:#}");
+                    if let Mode::CreateRemoteServer(state) = &this.mode {
+                        let mut updated = state.rebuild_with(None, None, None, None);
+                        updated.password_keychain_status = PasswordKeychainStatus::Error;
+                        updated.password_keychain_url = Some(url.clone());
+                        this.mode = Mode::CreateRemoteServer(updated);
                     }
+                    this.show_password_toast("Failed to delete saved password.", cx);
                 }
             })
             .log_err();
@@ -2327,6 +2689,36 @@ impl RemoteServerProjects {
                     entries: std::array::from_fn(|_| NavigableEntry::focusable(cx)),
                 }
             }
+            (
+                ServerIndex::DevContainer(server_index),
+                RemoteConnectionOptions::Docker(connection),
+            ) => {
+                let host = match connection.host {
+                    DockerHost::Local => None,
+                    DockerHost::Wsl(options) => Some(DevContainerHost::Wsl {
+                        distro_name: options.distro_name,
+                        user: options.user,
+                    }),
+                    DockerHost::Ssh(options) => Some(DevContainerHost::Ssh {
+                        host: options.host.to_string(),
+                        username: options.username,
+                        port: options.port,
+                        args: options.args.unwrap_or_default(),
+                    }),
+                };
+                ViewServerOptionsState::DevContainer {
+                    connection: DevContainerConnection {
+                        name: connection.name,
+                        container_id: connection.container_id,
+                        use_podman: connection.use_podman,
+                        projects: Default::default(),
+                        host_projects: Default::default(),
+                        host,
+                    },
+                    server_index,
+                    entries: std::array::from_fn(|_| NavigableEntry::focusable(cx)),
+                }
+            }
             _ => {
                 log::error!("server index and connection options mismatch");
                 self.mode = Mode::default_mode(&BTreeSet::default(), cx);
@@ -2339,10 +2731,64 @@ impl RemoteServerProjects {
 
     fn view_in_progress_dev_container(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = Mode::CreateRemoteDevContainer(
-            CreateRemoteDevContainer::new(window, cx)
-                .progress(DevContainerCreationProgress::Creating),
+            CreateRemoteDevContainer::new(window, cx).with_progress(
+                DevContainerCreationProgress::Creating,
+                window,
+                cx,
+            ),
         );
         self.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn handle_devcontainer_progress_event(
+        &mut self,
+        event: DevContainerProgressEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Mode::CreateRemoteDevContainer(state) = &mut self.mode else {
+            return;
+        };
+
+        if state.build_state.is_none() {
+            state.build_state = Some(DevContainerBuildState::new(window, cx));
+        }
+
+        let Some(build_state) = state.build_state.as_mut() else {
+            return;
+        };
+
+        match event {
+            DevContainerProgressEvent::StepStarted(step) => {
+                build_state.start_step(step);
+                if state.progress == DevContainerCreationProgress::Initial {
+                    state.progress = DevContainerCreationProgress::Creating;
+                }
+            }
+            DevContainerProgressEvent::StepCompleted(step) => {
+                build_state.complete_step(step);
+                if build_state.status == DevContainerBuildStatus::Success {
+                    state.progress = DevContainerCreationProgress::Success;
+                }
+            }
+            DevContainerProgressEvent::StepFailed(step, message) => {
+                build_state.fail_step(step);
+                build_state.append_log_line(
+                    DevContainerLogLine {
+                        stream: DevContainerLogStream::Stderr,
+                        line: message.clone(),
+                    },
+                    window,
+                    cx,
+                );
+                state.progress = DevContainerCreationProgress::Error(message);
+            }
+            DevContainerProgressEvent::LogLine(line) => {
+                build_state.append_log_line(line, window, cx);
+            }
+        }
+
         cx.notify();
     }
 
@@ -2353,7 +2799,8 @@ impl RemoteServerProjects {
     ) -> Option<Entity<RemoteClient>> {
         self.retained_connections.iter().find_map(|client| {
             let client_state = client.read(cx);
-            if client_state.connection_options() == *connection_options && !client_state.is_disconnected()
+            if client_state.connection_options() == *connection_options
+                && !client_state.is_disconnected()
             {
                 Some(client.clone())
             } else {
@@ -2382,17 +2829,17 @@ impl RemoteServerProjects {
                 .update(|_, cx| {
                     (
                         session.read(cx).path_style(),
-                    project::Project::remote(
-                        session.clone(),
-                        app_state.client.clone(),
-                        app_state.node_runtime.clone(),
-                        app_state.user_store.clone(),
-                        app_state.languages.clone(),
-                        app_state.fs.clone(),
-                        true,
-                        cx,
-                    ),
-                )
+                        project::Project::remote(
+                            session.clone(),
+                            app_state.client.clone(),
+                            app_state.node_runtime.clone(),
+                            app_state.user_store.clone(),
+                            app_state.languages.clone(),
+                            app_state.fs.clone(),
+                            true,
+                            cx,
+                        ),
+                    )
                 })
                 .log_err()?;
 
@@ -2587,6 +3034,22 @@ impl RemoteServerProjects {
                 self.mode = Mode::default_mode(&self.ssh_config_servers, cx);
                 self.focus_handle.focus(window, cx);
             }
+            Mode::EditDevContainerName(state) => {
+                let new_name = state.editor.read(cx).text(cx);
+                let new_name = new_name.trim().to_string();
+                let index = state.index;
+                if !new_name.is_empty() {
+                    self.update_settings_file(cx, move |setting, _| {
+                        if let Some(connections) = setting.dev_container_connections.as_mut()
+                            && let Some(connection) = connections.get_mut(index.0)
+                        {
+                            connection.name = new_name.clone();
+                        }
+                    });
+                }
+                self.mode = Mode::default_mode(&self.ssh_config_servers, cx);
+                self.focus_handle.focus(window, cx);
+            }
             #[cfg(target_os = "windows")]
             Mode::AddWslDistro(state) => {
                 let delegate = &state.picker.read(cx).delegate;
@@ -2613,7 +3076,10 @@ impl RemoteServerProjects {
         }
     }
 
-    fn server_row_labels(&self, remote_server: &RemoteEntry) -> (IconName, SharedString, Option<SharedString>) {
+    fn server_row_labels(
+        &self,
+        remote_server: &RemoteEntry,
+    ) -> (IconName, SharedString, Option<SharedString>) {
         match remote_server {
             RemoteEntry::Project { connection, .. } => match connection {
                 Connection::Ssh(connection) => {
@@ -2631,13 +3097,11 @@ impl RemoteServerProjects {
                     (IconName::Box, connection.name.clone().into(), None)
                 }
             },
-            RemoteEntry::SshConfig { host, .. } => {
-                (
-                    IconName::Server,
-                    host.clone(),
-                    Some(SharedString::from("SSH config")),
-                )
-            }
+            RemoteEntry::SshConfig { host, .. } => (
+                IconName::Server,
+                host.clone(),
+                Some(SharedString::from("SSH config")),
+            ),
         }
     }
 
@@ -2653,18 +3117,12 @@ impl RemoteServerProjects {
                     false,
                     false,
                 ),
-                Connection::Wsl(connection) => (
-                    connection.distro_name.clone().into(),
-                    None,
-                    true,
-                    false,
-                ),
-                Connection::DevContainer(connection) => (
-                    connection.name.clone().into(),
-                    None,
-                    false,
-                    true,
-                ),
+                Connection::Wsl(connection) => {
+                    (connection.distro_name.clone().into(), None, true, false)
+                }
+                Connection::DevContainer(connection) => {
+                    (connection.name.clone().into(), None, false, true)
+                }
             },
             RemoteEntry::SshConfig { host, .. } => (host.clone(), None, false, false),
         }
@@ -2679,7 +3137,11 @@ impl RemoteServerProjects {
     }
 
     fn normalized_search_query(&self, tab: RemoteProjectsTab, cx: &App) -> String {
-        self.search_editor(tab).read(cx).text(cx).trim().to_lowercase()
+        self.search_editor(tab)
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_lowercase()
     }
 
     fn clear_search(
@@ -2835,44 +3297,55 @@ impl RemoteServerProjects {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let entry_key = RemoteEntryKey::from_entry(&remote_server);
-        let is_selected = selected_key
-            .is_some_and(|key| key.matches(&remote_server));
+        let is_selected = selected_key.is_some_and(|key| key.matches(&remote_server));
         let select = remote_server.select_entry().clone();
         let (icon, main_label, aux_label) = self.server_row_labels(&remote_server);
-
-        h_flex()
-            .id(("remote-server-row-container", ix))
-            .track_focus(&select.focus_handle)
-            .anchor_scroll(select.scroll_anchor.clone())
-            .on_action(cx.listener({
+        let build_row = {
+            let entry_key = entry_key.clone();
+            let select = select.clone();
+            let main_label = main_label.clone();
+            let aux_label = aux_label.clone();
+            move |window: &mut Window, cx: &mut Context<Self>| {
                 let entry_key = entry_key.clone();
-                move |this, _: &menu::Confirm, _window, cx| {
-                    this.selected_entry = Some(entry_key.clone());
-                    cx.notify();
-                }
-            }))
-            .child(
-                ListItem::new(("remote-server-row", ix))
-                    .toggle_state(
-                        is_selected || select.focus_handle.contains_focused(window, cx),
-                    )
-                    .inset(true)
-                    .spacing(ui::ListItemSpacing::Sparse)
-                    .start_slot(Icon::new(icon).color(Color::Muted))
+                let select = select.clone();
+                let aux_label = aux_label.clone();
+
+                h_flex()
+                    .id(("remote-server-row-container", ix))
+                    .track_focus(&select.focus_handle)
+                    .anchor_scroll(select.scroll_anchor.clone())
+                    .on_action(cx.listener({
+                        let entry_key = entry_key.clone();
+                        move |this, _: &menu::Confirm, _window, cx| {
+                            this.selected_entry = Some(entry_key.clone());
+                            cx.notify();
+                        }
+                    }))
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .overflow_hidden()
-                            .child(Label::new(main_label).size(LabelSize::Small))
-                            .children(aux_label.map(|label| {
-                                Label::new(label).size(LabelSize::Small).color(Color::Muted)
+                        ListItem::new(("remote-server-row", ix))
+                            .toggle_state(
+                                is_selected || select.focus_handle.contains_focused(window, cx),
+                            )
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(icon).color(Color::Muted))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .overflow_hidden()
+                                    .child(Label::new(main_label.clone()).size(LabelSize::Small))
+                                    .children(aux_label.map(|label| {
+                                        Label::new(label).size(LabelSize::Small).color(Color::Muted)
+                                    })),
+                            )
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.selected_entry = Some(entry_key.clone());
+                                cx.notify();
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.selected_entry = Some(entry_key.clone());
-                        cx.notify();
-                    })),
-            )
+            }
+        };
+        build_row(window, cx).into_any_element()
     }
 
     fn render_remote_details(
@@ -2970,9 +3443,7 @@ impl RemoteServerProjects {
                                     )
                                     .inset(true)
                                     .spacing(ui::ListItemSpacing::Sparse)
-                                    .start_slot(
-                                        Icon::new(IconName::Settings).color(Color::Muted),
-                                    )
+                                    .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
                                     .child(Label::new("View Server Options"))
                                     .on_click(cx.listener({
                                         let connection = connection.clone();
@@ -2997,12 +3468,11 @@ impl RemoteServerProjects {
                 }
                 .render(window, cx);
 
-                v_flex()
-                    .child(header)
-                    .child(ListSeparator)
-                    .child(list)
+                v_flex().child(header).child(ListSeparator).child(list)
             }
-            RemoteEntry::SshConfig { open_folder, host, .. } => {
+            RemoteEntry::SshConfig {
+                open_folder, host, ..
+            } => {
                 let connection_string = host.clone();
                 let connection = remote_server.connection().into_owned();
                 let list = List::new().child(
@@ -3053,10 +3523,7 @@ impl RemoteServerProjects {
                 }
                 .render(window, cx);
 
-                v_flex()
-                    .child(header)
-                    .child(ListSeparator)
-                    .child(list)
+                v_flex().child(header).child(ListSeparator).child(list)
             }
         }
     }
@@ -3187,6 +3654,60 @@ impl RemoteServerProjects {
             )
     }
 
+    fn open_remote_project_from_paths(
+        &mut self,
+        connection: Connection,
+        paths: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let create_new_window = self.create_new_window;
+        let Some(app_state) = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.app_state().clone())
+            .log_err()
+        else {
+            return;
+        };
+        cx.emit(DismissEvent);
+
+        let replace_window = if create_new_window {
+            None
+        } else {
+            window.window_handle().downcast::<Workspace>()
+        };
+        let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+
+        cx.spawn_in(window, async move |_, cx| {
+            let result = open_remote_project(
+                connection.into(),
+                paths,
+                app_state,
+                OpenOptions {
+                    replace_window,
+                    ..OpenOptions::default()
+                },
+                cx,
+            )
+            .await;
+            if let Err(e) = result {
+                log::error!("Failed to connect: {e:#}");
+                cx.prompt(
+                    gpui::PromptLevel::Critical,
+                    "Failed to connect",
+                    Some(&e.to_string()),
+                    &["Ok"],
+                )
+                .await
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn update_settings_file(
         &mut self,
         cx: &mut Context<Self>,
@@ -3206,19 +3727,403 @@ impl RemoteServerProjects {
         &mut self,
         connection: DevContainerConnection,
         starting_dir: String,
+        host_starting_dir: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.update_settings_file(cx, move |setting, _| {
             let connections = setting
                 .dev_container_connections
                 .get_or_insert(Default::default());
-            upsert_dev_container_connection(connections, connection, starting_dir);
+            upsert_dev_container_connection(
+                connections,
+                connection,
+                starting_dir,
+                host_starting_dir,
+            );
         });
     }
 
     fn delete_ssh_server(&mut self, server: SshServerIndex, cx: &mut Context<Self>) {
         self.update_settings_file(cx, move |setting, _| {
             if let Some(connections) = setting.ssh_connections.as_mut() {
+                connections.remove(server.0);
+            }
+        });
+    }
+
+    fn show_devcontainer_toast(&self, message: impl Into<SharedString>, cx: &mut App) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let message: SharedString = message.into();
+        let message_text = message.to_string();
+        workspace.update(cx, |workspace, cx| {
+            struct DevContainerToast;
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::composite::<DevContainerToast>(message_text.clone()),
+                    message_text.clone(),
+                )
+                .autohide(),
+                cx,
+            );
+        });
+    }
+
+    fn active_dev_container_client(
+        &self,
+        connection: &DevContainerConnection,
+        cx: &App,
+    ) -> Option<Entity<RemoteClient>> {
+        let key = DevContainerKey::from_connection(connection);
+        if let Some(workspace) = self.workspace.upgrade() {
+            let project = workspace.read(cx).project().clone();
+            if let Some(remote_options) = project.read(cx).remote_connection_options(cx) {
+                if dev_container_key_from_remote_options(&remote_options) == Some(key) {
+                    if let Some(client) = project.read(cx).remote_client() {
+                        if !client.read(cx).is_disconnected() {
+                            return Some(client);
+                        }
+                    }
+                }
+            }
+        }
+
+        let connection_options: RemoteConnectionOptions =
+            Connection::DevContainer(connection.clone()).into();
+        self.retained_connection_for(&connection_options, cx)
+    }
+
+    fn disconnect_active_dev_container(
+        &self,
+        connection: &DevContainerConnection,
+        server_not_running: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(client) = self.active_dev_container_client(connection, cx) else {
+            return false;
+        };
+        client.update(cx, |client, cx| {
+            client
+                .disconnect(server_not_running, cx)
+                .detach_and_log_err(cx);
+        });
+        true
+    }
+
+    fn prompt_disconnect_dev_container(
+        remote_servers: Entity<RemoteServerProjects>,
+        name: SharedString,
+        connection: DevContainerConnection,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let prompt_message = format!("Disconnect from `{}`?", name);
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            &prompt_message,
+            Some("The container will keep running, and the host folder will reopen."),
+            &["Disconnect", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |_, cx| {
+            if confirmation.await.ok() == Some(0) {
+                let has_host_paths =
+                    RemoteServerProjects::host_project_paths(&connection).is_some();
+                remote_servers
+                    .update_in(cx, |this, window, cx| {
+                        if has_host_paths || connection.host.is_none() {
+                            this.return_to_host_folder(&connection, window, cx);
+                        } else {
+                            let disconnected =
+                                this.disconnect_active_dev_container(&connection, false, cx);
+                            if disconnected {
+                                this.show_devcontainer_toast(
+                                    format!("Disconnected from `{}`.", name),
+                                    cx,
+                                );
+                            } else {
+                                this.show_devcontainer_toast(
+                                    format!("No active connection to `{}`.", name),
+                                    cx,
+                                );
+                            }
+                        }
+                    })
+                    .ok();
+            }
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn prompt_return_to_host_folder(
+        remote_servers: Entity<RemoteServerProjects>,
+        name: SharedString,
+        connection: DevContainerConnection,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let prompt_message = format!("Return to the host folder from `{}`?", name);
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            &prompt_message,
+            Some("This will close the dev container workspace in this window."),
+            &["Return", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |_, cx| {
+            if confirmation.await.ok() == Some(0) {
+                remote_servers
+                    .update_in(cx, |this, window, cx| {
+                        this.return_to_host_folder(&connection, window, cx);
+                    })
+                    .ok();
+            }
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn prompt_stop_dev_container(
+        remote_servers: Entity<RemoteServerProjects>,
+        name: SharedString,
+        connection: DevContainerConnection,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let prompt_message = format!("Stop container for `{}`?", name);
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            &prompt_message,
+            Some("This will stop the container and disconnect if it is active."),
+            &["Stop and Disconnect", "Cancel"],
+            cx,
+        );
+
+        cx.spawn(async move |cx| {
+            if confirmation.await.ok() == Some(0) {
+                let result = stop_dev_container_container(&connection).await;
+                remote_servers.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            let disconnected =
+                                this.disconnect_active_dev_container(&connection, true, cx);
+                            let message = if disconnected {
+                                format!("Stopped container and disconnected `{}`.", name)
+                            } else {
+                                format!("Stopped container `{}`.", name)
+                            };
+                            this.show_devcontainer_toast(message, cx);
+                        }
+                        Err(message) => {
+                            this.show_devcontainer_toast(
+                                format!("Failed to stop `{}`: {}", name, message),
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn prompt_remove_dev_container(
+        remote_servers: Entity<RemoteServerProjects>,
+        index: DevContainerIndex,
+        name: SharedString,
+        connection: DevContainerConnection,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let prompt_message = format!("Remove dev container `{}`?", name);
+
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            &prompt_message,
+            Some(
+                "This will stop and delete the container, even if it is running. If Zed is connected, it will disconnect.",
+            ),
+            &["Remove and delete container", "Cancel"],
+            cx,
+        );
+
+        cx.spawn(async move |cx| {
+            if confirmation.await.ok() == Some(0) {
+                let result = remove_dev_container_container(&connection).await;
+                remote_servers.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            let disconnected =
+                                this.disconnect_active_dev_container(&connection, true, cx);
+                            this.delete_dev_container_server(index, cx);
+                            let message = if disconnected {
+                                format!("Removed dev container `{}` and disconnected.", name)
+                            } else {
+                                format!("Removed dev container `{}`.", name)
+                            };
+                            this.show_devcontainer_toast(message, cx);
+                            this.mode = Mode::default_mode(&this.ssh_config_servers, cx);
+                        }
+                        Err(message) => {
+                            this.show_devcontainer_toast(
+                                format!("Failed to remove `{}`: {}", name, message),
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn host_project_paths(connection: &DevContainerConnection) -> Option<Vec<PathBuf>> {
+        connection
+            .host_projects
+            .iter()
+            .next()
+            .map(|project| project.paths.iter().map(PathBuf::from).collect())
+    }
+
+    fn host_connection_options(
+        connection: &DevContainerConnection,
+    ) -> Option<RemoteConnectionOptions> {
+        let host = connection.host.as_ref()?;
+        match host {
+            DevContainerHost::Ssh {
+                host,
+                username,
+                port,
+                args,
+            } => Some(RemoteConnectionOptions::Ssh(SshConnectionOptions {
+                host: host.clone().into(),
+                username: username.clone(),
+                port: *port,
+                args: Some(args.clone()),
+                ..SshConnectionOptions::default()
+            })),
+            DevContainerHost::Wsl { distro_name, user } => {
+                Some(RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                    distro_name: distro_name.clone(),
+                    user: user.clone(),
+                }))
+            }
+        }
+    }
+
+    fn return_to_host_folder(
+        &self,
+        connection: &DevContainerConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(DismissEvent);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(paths) = Self::host_project_paths(connection) else {
+            if connection.host.is_none() {
+                self.return_to_local_folder(window, cx);
+            } else {
+                self.show_devcontainer_toast("No host folder recorded for this dev container.", cx);
+            }
+            return;
+        };
+
+        if let Some(connection_options) = Self::host_connection_options(connection) {
+            let Some(app_state) = workspace
+                .read_with(cx, |workspace, _| workspace.app_state().clone())
+                .log_err()
+            else {
+                return;
+            };
+            let replace_window = window.window_handle().downcast::<Workspace>();
+            let remote_servers = cx.entity();
+            cx.spawn_in(window, async move |_, cx| {
+                let result = open_remote_project(
+                    connection_options,
+                    paths,
+                    app_state,
+                    OpenOptions {
+                        replace_window,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .await;
+                if let Err(err) = result {
+                    log::error!("Failed to open host folder: {err:#}");
+                    remote_servers.update(cx, |this, cx| {
+                        this.show_devcontainer_toast(
+                            format!("Failed to open host folder: {err:#}"),
+                            cx,
+                        );
+                    });
+                }
+                anyhow::Ok(())
+            })
+            .detach();
+        } else {
+            let workspace_handle = workspace.clone();
+            cx.spawn_in(window, async move |_, cx| {
+                if let Some(task) = workspace_handle
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_workspace_for_paths(true, paths, window, cx)
+                    })
+                    .log_err()
+                {
+                    task.await.log_err();
+                }
+                anyhow::Ok(())
+            })
+            .detach();
+        }
+    }
+
+    fn return_to_local_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: None,
+        });
+
+        let workspace_handle = workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(result) = prompt.await else {
+                return Ok(());
+            };
+            let Some(paths) = result.log_err().flatten() else {
+                return Ok(());
+            };
+
+            if let Some(task) = workspace_handle
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_workspace_for_paths(true, paths, window, cx)
+                })
+                .log_err()
+            {
+                task.await.log_err();
+            }
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    fn delete_dev_container_server(&mut self, server: DevContainerIndex, cx: &mut Context<Self>) {
+        self.update_settings_file(cx, move |setting, _| {
+            if let Some(connections) = setting.dev_container_connections.as_mut() {
                 connections.remove(server.0);
             }
         });
@@ -3305,6 +4210,127 @@ impl RemoteServerProjects {
         });
     }
 
+    fn prune_dev_container_connections(
+        &mut self,
+        remove_keys: Vec<DevContainerKey>,
+        cx: &mut Context<Self>,
+    ) {
+        if remove_keys.is_empty() {
+            return;
+        }
+        let remove_keys: HashSet<DevContainerKey> = remove_keys.into_iter().collect();
+        self.update_settings_file(cx, move |setting, _| {
+            if let Some(connections) = setting.dev_container_connections.as_mut() {
+                connections.retain(|connection| {
+                    !remove_keys.contains(&DevContainerKey::from_connection(connection))
+                });
+            }
+        });
+    }
+
+    fn refresh_dev_container_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_dev_container_connections_inner(window, cx, true);
+    }
+
+    fn refresh_dev_container_connections_silent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_dev_container_connections_inner(window, cx, false);
+    }
+
+    fn refresh_dev_container_connections_inner(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify: bool,
+    ) {
+        let connections: Vec<DevContainerConnection> = RemoteSettings::get_global(cx)
+            .dev_container_connections()
+            .collect();
+        if connections.is_empty() {
+            if notify {
+                self.show_devcontainer_toast("No dev containers to refresh.", cx);
+            }
+            return;
+        }
+
+        let workspace = self.workspace.clone();
+        let remote_servers = cx.entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let mut missing = Vec::new();
+            let mut unknown = 0usize;
+            let executor = cx.background_executor().clone();
+            let mut probes = futures::stream::iter(connections.into_iter().map(|connection| {
+                let executor = executor.clone();
+                async move {
+                    let result = probe_dev_container(&connection)
+                        .with_timeout(DEV_CONTAINER_PROBE_TIMEOUT, &executor)
+                        .await
+                        .unwrap_or(DevContainerProbe::Unknown);
+                    (connection, result)
+                }
+            }))
+            .buffer_unordered(DEV_CONTAINER_PROBE_CONCURRENCY);
+
+            while let Some((connection, result)) = probes.next().await {
+                match result {
+                    DevContainerProbe::Exists => {}
+                    DevContainerProbe::Missing => {
+                        missing.push(DevContainerKey::from_connection(&connection));
+                    }
+                    DevContainerProbe::Unknown => {
+                        unknown += 1;
+                    }
+                }
+            }
+
+            let missing_count = missing.len();
+            if missing_count > 0 {
+                let remove_keys = missing.clone();
+                remote_servers.update(cx, |this, cx| {
+                    this.prune_dev_container_connections(remove_keys, cx);
+                });
+            }
+
+            if notify {
+                let message = if unknown > 0 && missing_count == 0 {
+                    format!("Could not verify {unknown} dev container(s).")
+                } else if missing_count > 0 {
+                    if unknown > 0 {
+                        format!(
+                            "Removed {} stale dev container(s). {unknown} could not be verified.",
+                            missing_count
+                        )
+                    } else {
+                        format!("Removed {} stale dev container(s).", missing_count)
+                    }
+                } else {
+                    "Dev containers are up to date.".to_string()
+                };
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        struct DevContainerRefreshToast;
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::composite::<DevContainerRefreshToast>(
+                                    message.clone(),
+                                ),
+                                message.clone(),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    });
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn add_ssh_server(
         &mut self,
         connection_options: remote::SshConnectionOptions,
@@ -3376,44 +4402,98 @@ impl RemoteServerProjects {
         else {
             return;
         };
+        let host_starting_dir = self
+            .workspace
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .project()
+                    .read(cx)
+                    .active_project_directory(cx)
+                    .map(|dir| dir.display().to_string())
+            })
+            .ok()
+            .flatten();
 
         let replace_window = window.window_handle().downcast::<Workspace>();
 
         cx.spawn_in(window, async move |entity, cx| {
-            let (dev_connection, starting_dir) =
-                match start_dev_container(cx, app_state.node_runtime.clone()).await {
-                    Ok((c, s)) => (c, s),
-                    Err(e) => {
-                        log::error!("Failed to start dev container: {:?}", e);
-                        entity
-                            .update_in(cx, |remote_server_projects, window, cx| {
-                                remote_server_projects.mode = Mode::CreateRemoteDevContainer(
-                                    CreateRemoteDevContainer::new(window, cx).progress(
-                                        DevContainerCreationProgress::Error(format!("{:?}", e)),
-                                    ),
-                                );
-                            })
-                            .log_err();
-                        return;
-                    }
-                };
+            let (progress_tx, mut progress_rx) = mpsc::unbounded::<DevContainerProgressEvent>();
+            let progress_entity = entity.clone();
+            cx.spawn(async move |cx| {
+                while let Some(event) = progress_rx.next().await {
+                    progress_entity
+                        .update_in(cx, |this, window, cx| {
+                            this.handle_devcontainer_progress_event(event, window, cx);
+                        })
+                        .ok();
+                }
+                anyhow::Ok(())
+            })
+            .detach();
+
+            let (dev_connection, starting_dir) = match start_dev_container_with_progress(
+                cx,
+                app_state.node_runtime.clone(),
+                Some(progress_tx),
+            )
+            .await
+            {
+                Ok((c, s)) => (c, s),
+                Err(e) => {
+                    log::error!("Failed to start dev container: {:?}", e);
+                    entity
+                        .update_in(cx, |remote_server_projects, window, cx| {
+                            let message = e.to_string();
+                            match &mut remote_server_projects.mode {
+                                Mode::CreateRemoteDevContainer(state) => {
+                                    if state.build_state.is_none() {
+                                        state.build_state =
+                                            Some(DevContainerBuildState::new(window, cx));
+                                    }
+                                    if let Some(build_state) = state.build_state.as_mut() {
+                                        build_state.append_log_line(
+                                            DevContainerLogLine {
+                                                stream: DevContainerLogStream::Stderr,
+                                                line: message.clone(),
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    state.progress =
+                                        DevContainerCreationProgress::Error(message.clone());
+                                    cx.notify();
+                                }
+                                _ => {
+                                    remote_server_projects.mode = Mode::CreateRemoteDevContainer(
+                                        CreateRemoteDevContainer::new(window, cx).with_progress(
+                                            DevContainerCreationProgress::Error(message.clone()),
+                                            window,
+                                            cx,
+                                        ),
+                                    );
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .log_err();
+                    return;
+                }
+            };
             let connection = Connection::DevContainer(dev_connection.clone());
+            let host_starting_dir =
+                Self::normalize_host_starting_dir(&dev_connection, host_starting_dir).await;
 
             entity
                 .update(cx, |remote_server_projects, cx| {
                     remote_server_projects.save_dev_container_connection(
                         dev_connection,
                         starting_dir.clone(),
+                        host_starting_dir.clone(),
                         cx,
                     );
                 })
                 .log_err();
-            entity
-                .update(cx, |_, cx| {
-                    cx.emit(DismissEvent);
-                })
-                .log_err();
-
             let result = open_remote_project(
                 connection.into(),
                 vec![starting_dir].into_iter().map(PathBuf::from).collect(),
@@ -3425,19 +4505,119 @@ impl RemoteServerProjects {
                 cx,
             )
             .await;
-            if let Err(e) = result {
-                log::error!("Failed to connect: {e:#}");
-                cx.prompt(
-                    gpui::PromptLevel::Critical,
-                    "Failed to connect",
-                    Some(&e.to_string()),
-                    &["Ok"],
-                )
-                .await
-                .ok();
+            match result {
+                Ok(_) => {
+                    entity
+                        .update_in(cx, |remote_server_projects, _, cx| {
+                            if let Mode::CreateRemoteDevContainer(state) =
+                                &mut remote_server_projects.mode
+                            {
+                                state.progress = DevContainerCreationProgress::Success;
+                                cx.notify();
+                            }
+                        })
+                        .log_err();
+                }
+                Err(e) => {
+                    log::error!("Failed to connect: {e:#}");
+                    entity
+                        .update_in(cx, |remote_server_projects, window, cx| {
+                            if let Mode::CreateRemoteDevContainer(state) =
+                                &mut remote_server_projects.mode
+                            {
+                                if state.build_state.is_none() {
+                                    state.build_state =
+                                        Some(DevContainerBuildState::new(window, cx));
+                                }
+                                if let Some(build_state) = state.build_state.as_mut() {
+                                    build_state.fail_step(DevContainerBuildStep::ReadConfiguration);
+                                    build_state.append_log_line(
+                                        DevContainerLogLine {
+                                            stream: DevContainerLogStream::Stderr,
+                                            line: e.to_string(),
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                state.progress = DevContainerCreationProgress::Error(e.to_string());
+                                cx.notify();
+                            }
+                        })
+                        .log_err();
+                    cx.prompt(
+                        gpui::PromptLevel::Critical,
+                        "Failed to connect",
+                        Some(&e.to_string()),
+                        &["Ok"],
+                    )
+                    .await
+                    .ok();
+                }
             }
         })
         .detach();
+    }
+
+    async fn normalize_host_starting_dir(
+        connection: &DevContainerConnection,
+        host_starting_dir: Option<String>,
+    ) -> Option<String> {
+        let Some(path) = host_starting_dir else {
+            return None;
+        };
+        let Some(DevContainerHost::Wsl { distro_name, user }) = connection.host.as_ref() else {
+            return Some(path);
+        };
+
+        #[cfg(target_os = "windows")]
+        {
+            if path.starts_with('/') {
+                return Some(path);
+            }
+            if let Some(wsl_path) = wsl_unc_path_to_posix(&path, distro_name) {
+                return Some(wsl_path);
+            }
+            let options = WslConnectionOptions {
+                distro_name: distro_name.clone(),
+                user: user.clone(),
+            };
+            match options.abs_windows_path_to_wsl_path(Path::new(&path)).await {
+                Ok(wsl_path) => Some(wsl_path),
+                Err(err) => {
+                    log::warn!("Failed to convert host path to WSL path: {err:#}");
+                    Some(path)
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Some(path)
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn wsl_unc_path_to_posix(path: &str, distro_name: &str) -> Option<String> {
+        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+        let prefixes = [
+            format!("\\\\wsl$\\\\{distro_name}"),
+            format!("\\\\wsl.localhost\\\\{distro_name}"),
+            format!("//wsl$/{distro_name}"),
+            format!("//wsl.localhost/{distro_name}"),
+        ];
+        for prefix in prefixes {
+            if path.starts_with(&prefix) {
+                let mut rest = &path[prefix.len()..];
+                rest = rest.strip_prefix('\\').unwrap_or(rest);
+                rest = rest.strip_prefix('/').unwrap_or(rest);
+                let mut converted = rest.replace('\\', "/");
+                if !converted.starts_with('/') {
+                    converted.insert(0, '/');
+                }
+                return Some(converted);
+            }
+        }
+        None
     }
 
     fn render_create_dev_container(
@@ -3446,72 +4626,337 @@ impl RemoteServerProjects {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        match &state.progress {
-            DevContainerCreationProgress::Error(message) => {
-                self.focus_handle(cx).focus(window, cx);
+        if state.progress != DevContainerCreationProgress::Initial {
+            self.focus_handle(cx).focus(window, cx);
+            let Some(build_state) = &state.build_state else {
                 return div()
                     .track_focus(&self.focus_handle(cx))
                     .size_full()
                     .child(
-                        v_flex()
-                            .py_1()
-                            .child(
-                                ListItem::new("Error")
-                                    .inset(true)
-                                    .selectable(false)
-                                    .spacing(ui::ListItemSpacing::Sparse)
-                                    .start_slot(Icon::new(IconName::XCircle).color(Color::Error))
-                                    .child(Label::new("Error Creating Dev Container:"))
-                                    .child(Label::new(message).buffer_font(cx)),
-                            )
-                            .child(ListSeparator)
-                            .child(
-                                div()
-                                    .id("devcontainer-go-back")
-                                    .track_focus(&state.entries[0].focus_handle)
-                                    .on_action(cx.listener(
-                                        |this, _: &menu::Confirm, window, cx| {
-                                            this.mode =
-                                                Mode::default_mode(&this.ssh_config_servers, cx);
-                                            cx.focus_self(window);
-                                            cx.notify();
-                                        },
-                                    ))
-                                    .child(
-                                        ListItem::new("li-devcontainer-go-back")
-                                            .toggle_state(
-                                                state.entries[0]
-                                                    .focus_handle
-                                                    .contains_focused(window, cx),
-                                            )
-                                            .inset(true)
-                                            .spacing(ui::ListItemSpacing::Sparse)
-                                            .start_slot(
-                                                Icon::new(IconName::ArrowLeft).color(Color::Muted),
-                                            )
-                                            .child(Label::new("Go Back"))
-                                            .end_slot(
-                                                KeyBinding::for_action_in(
-                                                    &menu::Cancel,
-                                                    &self.focus_handle,
-                                                    cx,
-                                                )
-                                                .size(rems_from_px(12.)),
-                                            )
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                let state =
-                                                    CreateRemoteDevContainer::new(window, cx);
-                                                this.mode = Mode::CreateRemoteDevContainer(state);
-
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
+                        v_flex().py_1().gap_1().child(
+                            Callout::new()
+                                .severity(Severity::Warning)
+                                .title("Preparing dev container build")
+                                .description("Waiting for progress data..."),
+                        ),
                     )
                     .into_any_element();
-            }
-            _ => {}
-        };
+            };
+
+            let theme = cx.theme();
+            let (status_text, status_color, status_icon, status_animate) = match build_state.status
+            {
+                DevContainerBuildStatus::Running => {
+                    ("Running", Color::Accent, IconName::ArrowCircle, true)
+                }
+                DevContainerBuildStatus::Success => {
+                    ("Success", Color::Success, IconName::Check, false)
+                }
+                DevContainerBuildStatus::Failed => {
+                    ("Failed", Color::Error, IconName::XCircle, false)
+                }
+            };
+            let status_icon = if status_animate {
+                Icon::new(status_icon)
+                    .color(status_color)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                Icon::new(status_icon)
+                    .color(status_color)
+                    .into_any_element()
+            };
+
+            let status_row = h_flex()
+                .gap_0p5()
+                .items_center()
+                .child(
+                    Label::new("Status")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    h_flex().gap_0p5().items_center().child(status_icon).child(
+                        Label::new(status_text)
+                            .size(LabelSize::Small)
+                            .color(status_color),
+                    ),
+                );
+
+            let steps_view = v_flex()
+                .gap_0p5()
+                .children(build_state.steps.iter().enumerate().map(|(index, step)| {
+                    let (icon_name, icon_color, icon_animate, step_status_text, step_status_color) =
+                        match step.status {
+                            DevContainerStepStatus::Pending => (
+                                IconName::Circle,
+                                Color::Muted,
+                                false,
+                                "Pending",
+                                Color::Muted,
+                            ),
+                            DevContainerStepStatus::Running => (
+                                IconName::ArrowCircle,
+                                Color::Accent,
+                                true,
+                                "Running",
+                                Color::Accent,
+                            ),
+                            DevContainerStepStatus::Completed => (
+                                IconName::Check,
+                                Color::Success,
+                                false,
+                                "Done",
+                                Color::Success,
+                            ),
+                            DevContainerStepStatus::Failed => (
+                                IconName::XCircle,
+                                Color::Error,
+                                false,
+                                "Failed",
+                                Color::Error,
+                            ),
+                        };
+                    let icon = if icon_animate {
+                        Icon::new(icon_name)
+                            .color(icon_color)
+                            .with_rotate_animation(2)
+                            .into_any_element()
+                    } else {
+                        Icon::new(icon_name).color(icon_color).into_any_element()
+                    };
+
+                    let mut label = Label::new(step.label.clone()).size(LabelSize::Small);
+                    if index == build_state.selected_step {
+                        label = label.color(Color::Accent);
+                    }
+
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .justify_between()
+                        .child(h_flex().gap_1().items_center().child(icon).child(label))
+                        .child(
+                            Label::new(step_status_text)
+                                .size(LabelSize::XSmall)
+                                .color(step_status_color),
+                        )
+                        .into_any_element()
+                }));
+
+            let error_callout =
+                if let DevContainerCreationProgress::Error(message) = &state.progress {
+                    let hints = devcontainer_error_hints(message);
+                    let mut description_children: Vec<AnyElement> = Vec::new();
+                    description_children.push(
+                        Label::new(message)
+                            .size(LabelSize::Small)
+                            .buffer_font(cx)
+                            .into_any_element(),
+                    );
+                    if !hints.is_empty() {
+                        description_children.push(
+                            Label::new("Suggested fixes:")
+                                .size(LabelSize::Small)
+                                .into_any_element(),
+                        );
+                        for hint in hints {
+                            description_children.push(
+                                Label::new(format!("• {}", hint))
+                                    .size(LabelSize::Small)
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                    Some(
+                        Callout::new()
+                            .severity(Severity::Error)
+                            .title("Build failed")
+                            .description_slot(v_flex().gap_0p5().children(description_children))
+                            .into_any_element(),
+                    )
+                } else {
+                    None
+                };
+
+            let log_header = h_flex().items_center().justify_between().child(
+                h_flex()
+                    .gap_0p5()
+                    .items_center()
+                    .child(Label::new("Build Logs").size(LabelSize::Small))
+                    .child(
+                        Label::new("Live")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+
+            let log_container = div()
+                .border_1()
+                .border_color(theme.colors().border_variant)
+                .rounded_sm()
+                .bg(theme.colors().editor_background)
+                .p_1()
+                .min_h(rems(12.))
+                .max_h(rems(20.))
+                .child(build_state.log_editor.clone());
+
+            let finish_enabled = build_state.status != DevContainerBuildStatus::Running;
+            let finish_style = match build_state.status {
+                DevContainerBuildStatus::Success => ButtonStyle::Tinted(TintColor::Success),
+                DevContainerBuildStatus::Failed => ButtonStyle::Tinted(TintColor::Error),
+                DevContainerBuildStatus::Running => ButtonStyle::Tinted(TintColor::Accent),
+            };
+
+            let actions = h_flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .id("devcontainer-progress-back")
+                                .track_focus(&build_state.back_entry.focus_handle)
+                                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                    if let Mode::CreateRemoteDevContainer(state) = &mut this.mode {
+                                        if let Some(build_state) = state.build_state.as_mut() {
+                                            build_state.select_previous_step();
+                                            build_state.log_editor.update(cx, |editor, cx| {
+                                                editor.move_to_beginning(
+                                                    &editor::actions::MoveToBeginning,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                        cx.notify();
+                                    }
+                                    cx.focus_self(window);
+                                }))
+                                .child(
+                                    Button::new("devcontainer-progress-back-button", "Back")
+                                        .icon(IconName::ArrowLeft)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if let Mode::CreateRemoteDevContainer(state) =
+                                                &mut this.mode
+                                            {
+                                                if let Some(build_state) =
+                                                    state.build_state.as_mut()
+                                                {
+                                                    build_state.select_previous_step();
+                                                    build_state.log_editor.update(
+                                                        cx,
+                                                        |editor, cx| {
+                                                            editor.move_to_beginning(
+                                                                &editor::actions::MoveToBeginning,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    );
+                                                }
+                                                cx.notify();
+                                            }
+                                            cx.focus_self(window);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("devcontainer-progress-close")
+                                .track_focus(&build_state.close_entry.focus_handle)
+                                .on_action(cx.listener(|_, _: &menu::Confirm, _, cx| {
+                                    cx.emit(DismissEvent);
+                                }))
+                                .child(
+                                    Button::new("devcontainer-progress-close-button", "Close")
+                                        .icon(IconName::Close)
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(DismissEvent);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .id("devcontainer-progress-copy-logs")
+                                .track_focus(&build_state.copy_entry.focus_handle)
+                                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| {
+                                    if let Mode::CreateRemoteDevContainer(state) = &this.mode {
+                                        if let Some(build_state) = &state.build_state {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                build_state.log_contents.clone(),
+                                            ));
+                                        }
+                                    }
+                                }))
+                                .child(
+                                    CopyButton::new(build_state.log_contents.clone())
+                                        .tooltip_label("Copy logs"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("devcontainer-progress-finish")
+                                .track_focus(&build_state.finish_entry.focus_handle)
+                                .on_action(cx.listener(move |_, _: &menu::Confirm, _, cx| {
+                                    if finish_enabled {
+                                        cx.emit(DismissEvent);
+                                    }
+                                }))
+                                .child(
+                                    Button::new("devcontainer-progress-finish-button", "Finish")
+                                        .style(finish_style)
+                                        .disabled(!finish_enabled)
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            if finish_enabled {
+                                                cx.emit(DismissEvent);
+                                            }
+                                        })),
+                                ),
+                        ),
+                );
+
+            let mut view = Navigable::new(
+                div()
+                    .track_focus(&self.focus_handle(cx))
+                    .size_full()
+                    .child(
+                        v_flex()
+                            .pb_1()
+                            .gap_1()
+                            .child(ModalHeader::new().child(
+                                Headline::new("Dev Container Setup").size(HeadlineSize::XSmall),
+                            ))
+                            .child(ListSeparator)
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .px_1()
+                                    .child(status_row)
+                                    .child(steps_view)
+                                    .when_some(error_callout, |this, callout| this.child(callout))
+                                    .child(log_header)
+                                    .child(log_container)
+                                    .child(actions),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+
+            view = view.entry(build_state.back_entry.clone());
+            view = view.entry(build_state.close_entry.clone());
+            view = view.entry(build_state.copy_entry.clone());
+            view = view.entry(build_state.finish_entry.clone());
+
+            return view.render(window, cx).into_any_element();
+        }
 
         let mut view = Navigable::new(
             div()
@@ -3691,11 +5136,7 @@ impl RemoteServerProjects {
 
         state.address_editor.update(cx, |editor, cx| {
             if editor.text(cx).is_empty() {
-                editor.set_placeholder_text(
-                    "user@host, host alias, or ssh command",
-                    window,
-                    cx,
-                );
+                editor.set_placeholder_text("user@host, host alias, or ssh command", window, cx);
             }
         });
 
@@ -3730,20 +5171,26 @@ impl RemoteServerProjects {
         let mode_toggle = ToggleButtonGroup::single_row(
             "ssh-input-mode",
             [
-                ToggleButtonSimple::new("Form", cx.listener(|this, _, window, cx| {
-                    if let Mode::CreateRemoteServer(state) = &mut this.mode {
-                        state.input_mode = CreateRemoteServerInputMode::Form;
-                        state.form.host_editor.focus_handle(cx).focus(window, cx);
-                        cx.notify();
-                    }
-                })),
-                ToggleButtonSimple::new("SSH Command", cx.listener(|this, _, window, cx| {
-                    if let Mode::CreateRemoteServer(state) = &mut this.mode {
-                        state.input_mode = CreateRemoteServerInputMode::Command;
-                        state.address_editor.focus_handle(cx).focus(window, cx);
-                        cx.notify();
-                    }
-                })),
+                ToggleButtonSimple::new(
+                    "Form",
+                    cx.listener(|this, _, window, cx| {
+                        if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                            state.input_mode = CreateRemoteServerInputMode::Form;
+                            state.form.host_editor.focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }
+                    }),
+                ),
+                ToggleButtonSimple::new(
+                    "SSH Command",
+                    cx.listener(|this, _, window, cx| {
+                        if let Mode::CreateRemoteServer(state) = &mut this.mode {
+                            state.input_mode = CreateRemoteServerInputMode::Command;
+                            state.address_editor.focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }
+                    }),
+                ),
             ],
         )
         .style(ToggleButtonGroupStyle::Outlined)
@@ -3766,16 +5213,12 @@ impl RemoteServerProjects {
                 host_history.push(SharedString::from(connection.host.clone()));
             }
             if let Some(username) = &connection.username {
-                if username_history.len() < HISTORY_MENU_LIMIT
-                    && username_seen.insert(username)
-                {
+                if username_history.len() < HISTORY_MENU_LIMIT && username_seen.insert(username) {
                     username_history.push(SharedString::from(username.clone()));
                 }
             }
             if let Some(port) = connection.port {
-                if port_history.len() < HISTORY_MENU_LIMIT
-                    && port_seen.insert(port)
-                {
+                if port_history.len() < HISTORY_MENU_LIMIT && port_seen.insert(port) {
                     port_history.push(SharedString::from(port.to_string()));
                 }
             }
@@ -3788,43 +5231,45 @@ impl RemoteServerProjects {
         }
 
         let weak_self = cx.weak_entity();
-        let history_menu = |id: &'static str,
-                            entries: Vec<SharedString>,
-                            tooltip: &'static str,
-                            on_select: Rc<dyn Fn(SharedString, &mut Window, &mut App)>| {
-            let has_entries = !entries.is_empty();
-            PopoverMenu::new(id)
-                .trigger(
-                    IconButton::new(format!("{id}-history"), IconName::HistoryRerun)
-                        .icon_size(IconSize::Small)
-                        .shape(IconButtonShape::Square)
-                        .size(ButtonSize::Large)
-                        .tooltip(Tooltip::text(tooltip))
-                        .disabled(!has_entries),
-                )
-                .menu({
-                    let entries = entries.clone();
-                    let on_select = on_select.clone();
-                    move |window, cx| {
+        let history_menu =
+            |id: &'static str,
+             entries: Vec<SharedString>,
+             tooltip: &'static str,
+             on_select: Rc<dyn Fn(SharedString, &mut Window, &mut App)>| {
+                let has_entries = !entries.is_empty();
+                PopoverMenu::new(id)
+                    .trigger(
+                        IconButton::new(format!("{id}-history"), IconName::HistoryRerun)
+                            .icon_size(IconSize::Small)
+                            .shape(IconButtonShape::Square)
+                            .size(ButtonSize::Large)
+                            .tooltip(Tooltip::text(tooltip))
+                            .disabled(!has_entries),
+                    )
+                    .menu({
                         let entries = entries.clone();
                         let on_select = on_select.clone();
-                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            if entries.is_empty() {
-                                menu = menu.header("No saved entries");
-                            } else {
-                                for entry in entries.iter() {
-                                    let entry = entry.clone();
-                                    let on_select = on_select.clone();
-                                    menu = menu.entry(entry.clone(), None, move |window, cx| {
-                                        on_select(entry.clone(), window, cx);
-                                    });
+                        move |window, cx| {
+                            let entries = entries.clone();
+                            let on_select = on_select.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                if entries.is_empty() {
+                                    menu = menu.header("No saved entries");
+                                } else {
+                                    for entry in entries.iter() {
+                                        let entry = entry.clone();
+                                        let on_select = on_select.clone();
+                                        menu =
+                                            menu.entry(entry.clone(), None, move |window, cx| {
+                                                on_select(entry.clone(), window, cx);
+                                            });
+                                    }
                                 }
-                            }
-                            menu
-                        }))
-                    }
-                })
-        };
+                                menu
+                            }))
+                        }
+                    })
+            };
 
         let field = |label: SharedString, editor: Entity<Editor>, error: Option<SharedString>| {
             let mut element = v_flex()
@@ -3840,11 +5285,8 @@ impl RemoteServerProjects {
                         .child(editor),
                 );
             if let Some(error) = error {
-                element = element.child(
-                    Label::new(error)
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                );
+                element =
+                    element.child(Label::new(error).size(LabelSize::Small).color(Color::Error));
             }
             element
         };
@@ -3872,11 +5314,7 @@ impl RemoteServerProjects {
                         ),
                 );
             if let Some(error) = error {
-                field = field.child(
-                    Label::new(error)
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                );
+                field = field.child(Label::new(error).size(LabelSize::Small).color(Color::Error));
             }
             field
         };
@@ -3905,43 +5343,43 @@ impl RemoteServerProjects {
             }));
 
         let ssh_config_hint = if read_ssh_config {
-            self.ssh_config_entries.get(selected_host.as_str()).map(|entry| {
-                let mut parts = Vec::new();
-                if let Some(user) = entry.user.as_deref() {
-                    parts.push(format!("user {user}"));
-                }
-                if let Some(port) = entry.port {
-                    parts.push(format!("port {port}"));
-                }
-                if let Some(hostname) = entry.hostname.as_deref() {
-                    parts.push(format!("host {hostname}"));
-                }
-                let details = if parts.is_empty() {
-                    "From SSH config".to_string()
-                } else {
-                    format!("From SSH config: {}", parts.join(", "))
-                };
-                let defaults_disabled = state.ssh_prompt.is_some() || state._creating.is_some();
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Label::new(details)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Button::new("ssh-use-config-defaults", "Use config defaults")
-                            .label_size(LabelSize::Small)
-                            .tooltip(Tooltip::text(
-                                "Only fills empty fields from SSH config.",
-                            ))
-                            .disabled(defaults_disabled)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.use_ssh_config_defaults(window, cx);
-                            })),
-                    )
-            })
+            self.ssh_config_entries
+                .get(selected_host.as_str())
+                .map(|entry| {
+                    let mut parts = Vec::new();
+                    if let Some(user) = entry.user.as_deref() {
+                        parts.push(format!("user {user}"));
+                    }
+                    if let Some(port) = entry.port {
+                        parts.push(format!("port {port}"));
+                    }
+                    if let Some(hostname) = entry.hostname.as_deref() {
+                        parts.push(format!("host {hostname}"));
+                    }
+                    let details = if parts.is_empty() {
+                        "From SSH config".to_string()
+                    } else {
+                        format!("From SSH config: {}", parts.join(", "))
+                    };
+                    let defaults_disabled = state.ssh_prompt.is_some() || state._creating.is_some();
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Label::new(details)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Button::new("ssh-use-config-defaults", "Use config defaults")
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text("Only fills empty fields from SSH config."))
+                                .disabled(defaults_disabled)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.use_ssh_config_defaults(window, cx);
+                                })),
+                        )
+                })
         } else {
             None
         };
@@ -3957,12 +5395,7 @@ impl RemoteServerProjects {
                     weak_self
                         .update(cx, |this, cx| {
                             if let Mode::CreateRemoteServer(state) = &mut this.mode {
-                                Self::set_editor_text(
-                                    &state.form.host_editor,
-                                    &value,
-                                    window,
-                                    cx,
-                                );
+                                Self::set_editor_text(&state.form.host_editor, &value, window, cx);
                                 state.form_errors.host = None;
                                 state.address_error = None;
                             }
@@ -4010,12 +5443,7 @@ impl RemoteServerProjects {
                     weak_self
                         .update(cx, |this, cx| {
                             if let Mode::CreateRemoteServer(state) = &mut this.mode {
-                                Self::set_editor_text(
-                                    &state.form.port_editor,
-                                    &value,
-                                    window,
-                                    cx,
-                                );
+                                Self::set_editor_text(&state.form.port_editor, &value, window, cx);
                                 state.form_errors.port = None;
                                 state.address_error = None;
                             }
@@ -5273,6 +6701,17 @@ impl RemoteServerProjects {
                     }
                     .render(window, cx)
                     .into_any_element(),
+                    ViewServerOptionsState::DevContainer { connection, .. } => {
+                        SshConnectionHeader {
+                            connection_string: connection.name.clone().into(),
+                            paths: Default::default(),
+                            nickname: None,
+                            is_wsl: false,
+                            is_devcontainer: true,
+                        }
+                        .render(window, cx)
+                        .into_any_element()
+                    }
                 })
                 .child(
                     v_flex()
@@ -5295,6 +6734,17 @@ impl RemoteServerProjects {
                                 entries,
                                 server_index,
                             } => this.child(self.render_edit_wsl(
+                                connection,
+                                *server_index,
+                                entries,
+                                window,
+                                cx,
+                            )),
+                            ViewServerOptionsState::DevContainer {
+                                connection,
+                                entries,
+                                server_index,
+                            } => this.child(self.render_edit_dev_container(
                                 connection,
                                 *server_index,
                                 entries,
@@ -5407,6 +6857,301 @@ impl RemoteServerProjects {
                         })),
                 )
         })
+    }
+
+    fn render_edit_dev_container(
+        &self,
+        connection: &DevContainerConnection,
+        index: DevContainerIndex,
+        entries: &[NavigableEntry],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let connection_name = SharedString::new(connection.name.clone());
+        let connection_for_disconnect = connection.clone();
+        let connection_for_stop = connection.clone();
+        let connection_for_remove = connection.clone();
+        let connection_for_reconnect = connection.clone();
+        let recent_project_paths = RemoteSettings::get_global(cx)
+            .dev_container_connections()
+            .nth(index.0)
+            .and_then(|connection| {
+                connection
+                    .projects
+                    .iter()
+                    .next()
+                    .map(|project| project.paths.clone())
+            });
+
+        v_flex()
+            .child({
+                let label = "Rename Dev Container";
+                div()
+                    .id("devcontainer-options-rename")
+                    .track_focus(&entries[0].focus_handle)
+                    .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                        this.mode = Mode::EditDevContainerName(EditDevContainerNameState::new(
+                            index, window, cx,
+                        ));
+                        cx.notify();
+                    }))
+                    .child(
+                        ListItem::new("rename-devcontainer")
+                            .toggle_state(entries[0].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                            .child(Label::new(label))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.mode = Mode::EditDevContainerName(
+                                    EditDevContainerNameState::new(index, window, cx),
+                                );
+                                cx.notify();
+                            })),
+                    )
+            })
+            .child({
+                div()
+                    .id("devcontainer-options-refresh")
+                    .track_focus(&entries[1].focus_handle)
+                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                        this.refresh_dev_container_connections(window, cx);
+                    }))
+                    .child(
+                        ListItem::new("refresh-devcontainer")
+                            .toggle_state(entries[1].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::RotateCw).color(Color::Muted))
+                            .child(Label::new("Refresh Dev Containers"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.refresh_dev_container_connections(window, cx);
+                            })),
+                    )
+            })
+            .child({
+                div()
+                    .id("devcontainer-options-reconnect")
+                    .track_focus(&entries[2].focus_handle)
+                    .on_action(cx.listener({
+                        let connection = connection_for_reconnect.clone();
+                        let recent_project_paths = recent_project_paths.clone();
+                        move |this, _: &menu::Confirm, window, cx| {
+                            if let Some(paths) = recent_project_paths.clone() {
+                                this.open_remote_project_from_paths(
+                                    Connection::DevContainer(connection.clone()),
+                                    paths,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.create_remote_project(
+                                    ServerIndex::DevContainer(index),
+                                    Connection::DevContainer(connection.clone()).into(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            cx.focus_self(window);
+                        }
+                    }))
+                    .child(
+                        ListItem::new("reconnect-devcontainer")
+                            .toggle_state(entries[2].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::PlayFilled).color(Color::Muted))
+                            .child(Label::new("Reconnect Dev Container"))
+                            .on_click(cx.listener({
+                                let connection = connection_for_reconnect.clone();
+                                let recent_project_paths = recent_project_paths.clone();
+                                move |this, _, window, cx| {
+                                    if let Some(paths) = recent_project_paths.clone() {
+                                        this.open_remote_project_from_paths(
+                                            Connection::DevContainer(connection.clone()),
+                                            paths,
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        this.create_remote_project(
+                                            ServerIndex::DevContainer(index),
+                                            Connection::DevContainer(connection.clone()).into(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    cx.focus_self(window);
+                                }
+                            })),
+                    )
+            })
+            .child({
+                div()
+                    .id("devcontainer-options-disconnect")
+                    .track_focus(&entries[3].focus_handle)
+                    .on_action(cx.listener({
+                        let connection_name = connection_name.clone();
+                        let connection = connection_for_disconnect.clone();
+                        move |_, _: &menu::Confirm, window, cx| {
+                            Self::prompt_disconnect_dev_container(
+                                cx.entity(),
+                                connection_name.clone(),
+                                connection.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.focus_self(window);
+                        }
+                    }))
+                    .child(
+                        ListItem::new("disconnect-devcontainer")
+                            .toggle_state(entries[3].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::Disconnected).color(Color::Muted))
+                            .child(Label::new("Disconnect Dev Container"))
+                            .on_click(cx.listener({
+                                let connection_name = connection_name.clone();
+                                let connection = connection_for_disconnect.clone();
+                                move |_, _, window, cx| {
+                                    Self::prompt_disconnect_dev_container(
+                                        cx.entity(),
+                                        connection_name.clone(),
+                                        connection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.focus_self(window);
+                                }
+                            })),
+                    )
+            })
+            .child({
+                div()
+                    .id("devcontainer-options-return-host")
+                    .track_focus(&entries[4].focus_handle)
+                    .on_action(cx.listener({
+                        let connection_name = connection_name.clone();
+                        let connection = connection.clone();
+                        move |_, _: &menu::Confirm, window, cx| {
+                            Self::prompt_return_to_host_folder(
+                                cx.entity(),
+                                connection_name.clone(),
+                                connection.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.focus_self(window);
+                        }
+                    }))
+                    .child(
+                        ListItem::new("return-host-devcontainer")
+                            .toggle_state(entries[4].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::Exit).color(Color::Muted))
+                            .child(Label::new("Return to Host Folder"))
+                            .on_click(cx.listener({
+                                let connection_name = connection_name.clone();
+                                let connection = connection.clone();
+                                move |_, _, window, cx| {
+                                    Self::prompt_return_to_host_folder(
+                                        cx.entity(),
+                                        connection_name.clone(),
+                                        connection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.focus_self(window);
+                                }
+                            })),
+                    )
+            })
+            .child({
+                div()
+                    .id("devcontainer-options-stop")
+                    .track_focus(&entries[5].focus_handle)
+                    .on_action(cx.listener({
+                        let connection_name = connection_name.clone();
+                        let connection = connection_for_stop.clone();
+                        move |_, _: &menu::Confirm, window, cx| {
+                            Self::prompt_stop_dev_container(
+                                cx.entity(),
+                                connection_name.clone(),
+                                connection.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.focus_self(window);
+                        }
+                    }))
+                    .child(
+                        ListItem::new("stop-devcontainer")
+                            .toggle_state(entries[5].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::Stop).color(Color::Warning))
+                            .child(Label::new("Stop Container and Disconnect"))
+                            .on_click(cx.listener({
+                                let connection_name = connection_name.clone();
+                                let connection = connection_for_stop.clone();
+                                move |_, _, window, cx| {
+                                    Self::prompt_stop_dev_container(
+                                        cx.entity(),
+                                        connection_name.clone(),
+                                        connection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.focus_self(window);
+                                }
+                            })),
+                    )
+            })
+            .child({
+                div()
+                    .id("devcontainer-options-remove")
+                    .track_focus(&entries[6].focus_handle)
+                    .on_action(cx.listener({
+                        let connection_name = connection_name.clone();
+                        let connection = connection_for_remove.clone();
+                        move |_, _: &menu::Confirm, window, cx| {
+                            Self::prompt_remove_dev_container(
+                                cx.entity(),
+                                index,
+                                connection_name.clone(),
+                                connection.clone(),
+                                window,
+                                cx,
+                            );
+                            cx.focus_self(window);
+                        }
+                    }))
+                    .child(
+                        ListItem::new("remove-devcontainer")
+                            .toggle_state(entries[6].focus_handle.contains_focused(window, cx))
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                            .child(Label::new("Remove Dev Container").color(Color::Error))
+                            .on_click(cx.listener({
+                                let connection_name = connection_name.clone();
+                                let connection = connection_for_remove.clone();
+                                move |_, _, window, cx| {
+                                    Self::prompt_remove_dev_container(
+                                        cx.entity(),
+                                        index,
+                                        connection_name.clone(),
+                                        connection.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.focus_self(window);
+                                }
+                            })),
+                    )
+            })
     }
 
     fn render_edit_ssh(
@@ -5613,6 +7358,45 @@ impl RemoteServerProjects {
             )
     }
 
+    fn render_edit_dev_container_name(
+        &self,
+        state: &EditDevContainerNameState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(connection) = RemoteSettings::get_global(cx)
+            .dev_container_connections()
+            .nth(state.index.0)
+        else {
+            return v_flex()
+                .id("devcontainer-edit-name")
+                .track_focus(&self.focus_handle(cx));
+        };
+
+        let connection_string = connection.name.clone();
+
+        v_flex()
+            .id("devcontainer-edit-name")
+            .track_focus(&self.focus_handle(cx))
+            .child(
+                SshConnectionHeader {
+                    connection_string: connection_string.into(),
+                    paths: Default::default(),
+                    nickname: None,
+                    is_wsl: false,
+                    is_devcontainer: true,
+                }
+                .render(window, cx),
+            )
+            .child(
+                h_flex()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(state.editor.clone()),
+            )
+    }
+
     fn render_default(
         &mut self,
         mut state: DefaultState,
@@ -5644,17 +7428,18 @@ impl RemoteServerProjects {
                 _ => None,
             }));
 
-        let dev_container_connections_changed = ssh_settings
-            .dev_container_connections
-            .0
-            .iter()
-            .ne(state.servers.iter().filter_map(|server| match server {
-                RemoteEntry::Project {
-                    connection: Connection::DevContainer(connection),
-                    ..
-                } => Some(connection),
-                _ => None,
-            }));
+        let dev_container_connections_changed =
+            ssh_settings
+                .dev_container_connections
+                .0
+                .iter()
+                .ne(state.servers.iter().filter_map(|server| match server {
+                    RemoteEntry::Project {
+                        connection: Connection::DevContainer(connection),
+                        ..
+                    } => Some(connection),
+                    _ => None,
+                }));
 
         if ssh_connections_changed || wsl_connections_changed || dev_container_connections_changed {
             should_rebuild = true;
@@ -5689,10 +7474,11 @@ impl RemoteServerProjects {
             }
         }
         if self.selected_entry.is_some()
-            && !state
-                .servers
-                .iter()
-                .any(|entry| self.selected_entry.as_ref().is_some_and(|key| key.matches(entry)))
+            && !state.servers.iter().any(|entry| {
+                self.selected_entry
+                    .as_ref()
+                    .is_some_and(|key| key.matches(entry))
+            })
         {
             self.selected_entry = None;
         }
@@ -5824,6 +7610,30 @@ impl RemoteServerProjects {
                 cx.notify();
             }));
 
+        let refresh_dev_container_button = div()
+            .id("refresh-dev-containers")
+            .track_focus(&state.refresh_devcontainer.focus_handle)
+            .anchor_scroll(state.refresh_devcontainer.scroll_anchor.clone())
+            .child(
+                ListItem::new("refresh-dev-containers-button")
+                    .toggle_state(
+                        state
+                            .refresh_devcontainer
+                            .focus_handle
+                            .contains_focused(window, cx),
+                    )
+                    .inset(true)
+                    .spacing(ui::ListItemSpacing::Sparse)
+                    .start_slot(Icon::new(IconName::RotateCw).color(Color::Muted))
+                    .child(Label::new("Refresh Dev Containers"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.refresh_dev_container_connections(window, cx);
+                    })),
+            )
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.refresh_dev_container_connections(window, cx);
+            }));
+
         #[cfg(target_os = "windows")]
         let wsl_connect_button = div()
             .id("wsl-connect-new-server")
@@ -5929,11 +7739,12 @@ impl RemoteServerProjects {
                     ToggleButtonSimple::new(format!("Dev Containers ({dev_container_count})"), {
                         let scroll_handle = scroll_handle.clone();
                         let first_dev_container_key = first_dev_container_key.clone();
-                        cx.listener(move |this, _event, _window, cx| {
+                        cx.listener(move |this, _event, window, cx| {
                             this.selected_tab = RemoteProjectsTab::DevContainers;
                             this.dev_container_page = 0;
                             this.selected_entry = first_dev_container_key.clone();
                             scroll_handle.scroll_to_top_of_item(0);
+                            this.refresh_dev_container_connections_silent(window, cx);
                             cx.notify();
                         })
                     }),
@@ -5966,11 +7777,12 @@ impl RemoteServerProjects {
                     ToggleButtonSimple::new(format!("Dev Containers ({dev_container_count})"), {
                         let scroll_handle = scroll_handle.clone();
                         let first_dev_container_key = first_dev_container_key.clone();
-                        cx.listener(move |this, _event, _window, cx| {
+                        cx.listener(move |this, _event, window, cx| {
                             this.selected_tab = RemoteProjectsTab::DevContainers;
                             this.dev_container_page = 0;
                             this.selected_entry = first_dev_container_key.clone();
                             scroll_handle.scroll_to_top_of_item(0);
+                            this.refresh_dev_container_connections_silent(window, cx);
                             cx.notify();
                         })
                     }),
@@ -6052,7 +7864,12 @@ impl RemoteServerProjects {
         let selected_entry = self
             .selected_entry
             .as_ref()
-            .and_then(|key| paged_servers.iter().find(|(_, entry)| key.matches(entry)).cloned())
+            .and_then(|key| {
+                paged_servers
+                    .iter()
+                    .find(|(_, entry)| key.matches(entry))
+                    .cloned()
+            })
             .or_else(|| paged_servers.first().cloned());
 
         let selected_key = selected_entry
@@ -6073,7 +7890,9 @@ impl RemoteServerProjects {
                 .next()
                 .map(|(_, entry)| RemoteEntryKey::from_entry(entry))
         };
-        let prev_page_key = (current_page > 0).then(|| page_first_key(current_page - 1)).flatten();
+        let prev_page_key = (current_page > 0)
+            .then(|| page_first_key(current_page - 1))
+            .flatten();
         let next_page_key = (current_page + 1 < total_pages)
             .then(|| page_first_key(current_page + 1))
             .flatten();
@@ -6108,7 +7927,9 @@ impl RemoteServerProjects {
         let mut left_column = v_flex().gap_1();
         left_column = match selected_tab {
             RemoteProjectsTab::Ssh => left_column.child(connect_button),
-            RemoteProjectsTab::DevContainers => left_column.child(connect_dev_container_button),
+            RemoteProjectsTab::DevContainers => left_column
+                .child(connect_dev_container_button)
+                .child(refresh_dev_container_button),
             RemoteProjectsTab::Wsl => {
                 #[cfg(target_os = "windows")]
                 {
@@ -6120,11 +7941,12 @@ impl RemoteServerProjects {
                 }
             }
         };
-        left_column = left_column.child(
-            div()
-                .px_2()
-                .child(self.render_search_bar(selected_tab, has_search_query, window, cx)),
-        );
+        left_column = left_column.child(div().px_2().child(self.render_search_bar(
+            selected_tab,
+            has_search_query,
+            window,
+            cx,
+        )));
 
         if total_pages > 1 {
             let scroll_handle_prev = scroll_handle.clone();
@@ -6221,15 +8043,17 @@ impl RemoteServerProjects {
             .size_full()
             .child(columns);
 
-        let mut modal_section =
-            Navigable::new(modal_section.into_any_element());
+        let mut modal_section = Navigable::new(modal_section.into_any_element());
 
         if selected_tab == RemoteProjectsTab::Ssh {
             modal_section = modal_section.entry(state.add_new_server.clone());
         }
 
-        if selected_tab == RemoteProjectsTab::DevContainers && has_open_project {
-            modal_section = modal_section.entry(state.add_new_devcontainer.clone());
+        if selected_tab == RemoteProjectsTab::DevContainers {
+            modal_section = modal_section.entry(state.refresh_devcontainer.clone());
+            if has_open_project {
+                modal_section = modal_section.entry(state.add_new_devcontainer.clone());
+            }
         }
 
         if selected_tab == RemoteProjectsTab::Wsl && cfg!(target_os = "windows") {
@@ -6446,7 +8270,10 @@ fn split_user_host(value: &str) -> Option<(String, String)> {
 fn parse_port_forwards(input: &str) -> (Vec<SshPortForwardOption>, Vec<SharedString>) {
     let mut forwards = Vec::new();
     let mut errors = Vec::new();
-    for (index, raw) in input.split(|c| c == ',' || c == '\n' || c == ';').enumerate() {
+    for (index, raw) in input
+        .split(|c| c == ',' || c == '\n' || c == ';')
+        .enumerate()
+    {
         let spec = raw.trim();
         if spec.is_empty() {
             continue;
@@ -6510,10 +8337,339 @@ impl Render for RemoteServerProjects {
                 Mode::EditNickname(state) => self
                     .render_edit_nickname(state, window, cx)
                     .into_any_element(),
+                Mode::EditDevContainerName(state) => self
+                    .render_edit_dev_container_name(state, window, cx)
+                    .into_any_element(),
                 #[cfg(target_os = "windows")]
                 Mode::AddWslDistro(state) => self
                     .render_add_wsl_distro(state, window, cx)
                     .into_any_element(),
             })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DevContainerProbe {
+    Exists,
+    Missing,
+    Unknown,
+}
+
+async fn probe_dev_container(connection: &DevContainerConnection) -> DevContainerProbe {
+    let docker_bin = if connection.use_podman {
+        "podman"
+    } else {
+        "docker"
+    };
+    let args = vec!["inspect".to_string(), connection.container_id.clone()];
+
+    let output = match &connection.host {
+        None => new_smol_command(docker_bin)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|err| {
+                log::warn!("Failed to run {} locally: {err}", docker_bin);
+                err
+            }),
+        Some(DevContainerHost::Wsl { distro_name, user }) => {
+            let cmd = build_shell_command(docker_bin, &args);
+            let mut command = new_smol_command("wsl.exe");
+            command.arg("--distribution");
+            command.arg(distro_name);
+            if let Some(user) = user {
+                command.arg("--user");
+                command.arg(user);
+            }
+            command.arg("--");
+            command.arg("sh");
+            command.arg("-lc");
+            command.arg(wrap_bashrc(&cmd));
+            command.output().await.map_err(|err| {
+                log::warn!("Failed to run {} in WSL: {err}", docker_bin);
+                err
+            })
+        }
+        Some(DevContainerHost::Ssh {
+            host,
+            username,
+            port,
+            args: ssh_args,
+        }) => {
+            let options = SshConnectionOptions {
+                host: host.clone().into(),
+                username: username.clone(),
+                port: *port,
+                args: Some(ssh_args.clone()),
+                ..SshConnectionOptions::default()
+            };
+            let mut args_list = options.additional_args();
+            args_list.push("-q".to_string());
+            args_list.push("-T".to_string());
+            args_list.push(options.ssh_destination());
+
+            let cmd = build_shell_command(docker_bin, &args);
+            let shell_kind = ShellKind::Posix;
+            let wrapped_script = wrap_bashrc(&cmd);
+            let wrapped_cmd = shell_kind
+                .try_quote(&wrapped_script)
+                .unwrap_or_else(|| Cow::Owned(cmd.clone()));
+            args_list.push(format!("sh -lc {}", wrapped_cmd));
+
+            new_smol_command("ssh")
+                .args(args_list)
+                .output()
+                .await
+                .map_err(|err| {
+                    log::warn!("Failed to run {} over SSH: {err}", docker_bin);
+                    err
+                })
+        }
+    };
+
+    match output {
+        Ok(output) if output.status.success() => DevContainerProbe::Exists,
+        Ok(output) => {
+            let message = output_message(&output);
+            let message = message.to_lowercase();
+            if is_docker_unavailable_output(&message) {
+                DevContainerProbe::Unknown
+            } else if is_missing_container_output(&message, &connection.container_id) {
+                DevContainerProbe::Missing
+            } else {
+                DevContainerProbe::Unknown
+            }
+        }
+        Err(_) => DevContainerProbe::Unknown,
+    }
+}
+
+async fn stop_dev_container_container(connection: &DevContainerConnection) -> Result<(), String> {
+    let docker_bin = if connection.use_podman {
+        "podman"
+    } else {
+        "docker"
+    };
+    let args = vec!["stop".to_string(), connection.container_id.clone()];
+
+    let output = match &connection.host {
+        None => new_smol_command(docker_bin)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|err| format!("Failed to run {docker_bin} locally: {err}"))?,
+        Some(DevContainerHost::Wsl { distro_name, user }) => {
+            let cmd = build_shell_command(docker_bin, &args);
+            let mut command = new_smol_command("wsl.exe");
+            command.arg("--distribution");
+            command.arg(distro_name);
+            if let Some(user) = user {
+                command.arg("--user");
+                command.arg(user);
+            }
+            command.arg("--");
+            command.arg("sh");
+            command.arg("-lc");
+            command.arg(wrap_bashrc(&cmd));
+            command
+                .output()
+                .await
+                .map_err(|err| format!("Failed to run {docker_bin} in WSL: {err}"))?
+        }
+        Some(DevContainerHost::Ssh {
+            host,
+            username,
+            port,
+            args: ssh_args,
+        }) => {
+            let options = SshConnectionOptions {
+                host: host.clone().into(),
+                username: username.clone(),
+                port: *port,
+                args: Some(ssh_args.clone()),
+                ..SshConnectionOptions::default()
+            };
+            let mut args_list = options.additional_args();
+            args_list.push("-q".to_string());
+            args_list.push("-T".to_string());
+            args_list.push(options.ssh_destination());
+
+            let cmd = build_shell_command(docker_bin, &args);
+            let shell_kind = ShellKind::Posix;
+            let wrapped_script = wrap_bashrc(&cmd);
+            let wrapped_cmd = shell_kind
+                .try_quote(&wrapped_script)
+                .unwrap_or_else(|| Cow::Owned(cmd.clone()));
+            args_list.push(format!("sh -lc {}", wrapped_cmd));
+
+            new_smol_command("ssh")
+                .args(args_list)
+                .output()
+                .await
+                .map_err(|err| format!("Failed to run {docker_bin} over SSH: {err}"))?
+        }
+    };
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let mut message = String::new();
+        message.push_str(&String::from_utf8_lossy(&output.stderr));
+        message.push_str(&String::from_utf8_lossy(&output.stdout));
+        let message = message.trim();
+        if message.is_empty() {
+            Err(format!(
+                "{docker_bin} stop failed with exit code {}",
+                output.status
+            ))
+        } else {
+            Err(message.to_string())
+        }
+    }
+}
+
+async fn remove_dev_container_container(connection: &DevContainerConnection) -> Result<(), String> {
+    let docker_bin = if connection.use_podman {
+        "podman"
+    } else {
+        "docker"
+    };
+    let args = vec![
+        "rm".to_string(),
+        "-f".to_string(),
+        connection.container_id.clone(),
+    ];
+
+    let output = match &connection.host {
+        None => new_smol_command(docker_bin)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|err| format!("Failed to run {docker_bin} locally: {err}"))?,
+        Some(DevContainerHost::Wsl { distro_name, user }) => {
+            let cmd = build_shell_command(docker_bin, &args);
+            let mut command = new_smol_command("wsl.exe");
+            command.arg("--distribution");
+            command.arg(distro_name);
+            if let Some(user) = user {
+                command.arg("--user");
+                command.arg(user);
+            }
+            command.arg("--");
+            command.arg("sh");
+            command.arg("-lc");
+            command.arg(wrap_bashrc(&cmd));
+            command
+                .output()
+                .await
+                .map_err(|err| format!("Failed to run {docker_bin} in WSL: {err}"))?
+        }
+        Some(DevContainerHost::Ssh {
+            host,
+            username,
+            port,
+            args: ssh_args,
+        }) => {
+            let options = SshConnectionOptions {
+                host: host.clone().into(),
+                username: username.clone(),
+                port: *port,
+                args: Some(ssh_args.clone()),
+                ..SshConnectionOptions::default()
+            };
+            let mut args_list = options.additional_args();
+            args_list.push("-q".to_string());
+            args_list.push("-T".to_string());
+            args_list.push(options.ssh_destination());
+
+            let cmd = build_shell_command(docker_bin, &args);
+            let shell_kind = ShellKind::Posix;
+            let wrapped_script = wrap_bashrc(&cmd);
+            let wrapped_cmd = shell_kind
+                .try_quote(&wrapped_script)
+                .unwrap_or_else(|| Cow::Owned(cmd.clone()));
+            args_list.push(format!("sh -lc {}", wrapped_cmd));
+
+            new_smol_command("ssh")
+                .args(args_list)
+                .output()
+                .await
+                .map_err(|err| format!("Failed to run {docker_bin} over SSH: {err}"))?
+        }
+    };
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let mut message = String::new();
+        message.push_str(&String::from_utf8_lossy(&output.stderr));
+        message.push_str(&String::from_utf8_lossy(&output.stdout));
+        let message = message.trim();
+        if message.is_empty() {
+            Err(format!(
+                "{docker_bin} rm failed with exit code {}",
+                output.status
+            ))
+        } else {
+            Err(message.to_string())
+        }
+    }
+}
+
+fn build_shell_command(program: &str, args: &[String]) -> String {
+    let shell_kind = ShellKind::Posix;
+    let program = shell_kind
+        .try_quote_prefix_aware(program)
+        .unwrap_or_else(|| Cow::Owned(program.to_string()));
+    let mut command = String::new();
+    use std::fmt::Write as _;
+    let _ = write!(command, "{program}");
+    for arg in args {
+        let quoted = shell_kind
+            .try_quote(arg)
+            .unwrap_or_else(|| Cow::Owned(arg.clone()));
+        let _ = write!(command, " {quoted}");
+    }
+    command
+}
+
+fn wrap_bashrc(cmd: &str) -> String {
+    format!(
+        "if [ -f ~/.bash_profile ]; then . ~/.bash_profile >/dev/null 2>&1; fi; \
+if [ -f ~/.profile ]; then . ~/.profile >/dev/null 2>&1; fi; \
+if [ -f ~/.bashrc ]; then . ~/.bashrc >/dev/null 2>&1; fi; \
+if [ -f ~/.zprofile ]; then . ~/.zprofile >/dev/null 2>&1; fi; \
+{cmd}"
+    )
+}
+
+fn output_message(output: &std::process::Output) -> String {
+    let mut message = String::new();
+    message.push_str(&String::from_utf8_lossy(&output.stderr));
+    message.push_str(&String::from_utf8_lossy(&output.stdout));
+    message
+}
+
+fn is_missing_container_output(message: &str, container_id: &str) -> bool {
+    let short_id = container_id.get(..12).unwrap_or(container_id);
+    let mentions_container = message.contains(container_id)
+        || message.contains(short_id)
+        || message.contains("container");
+    let missing_marker = message.contains("no such")
+        || message.contains("not found")
+        || message.contains("does not exist")
+        || message.contains("no container")
+        || message.contains("no such object");
+    missing_marker && mentions_container
+}
+
+fn is_docker_unavailable_output(message: &str) -> bool {
+    message.contains("cannot connect")
+        || message.contains("failed to connect")
+        || message.contains("connection refused")
+        || message.contains("docker daemon")
+        || message.contains("podman socket")
+        || message.contains("permission denied")
+        || message.contains("access denied")
+        || message.contains("is the docker daemon running")
 }

@@ -1552,14 +1552,13 @@ impl Pane {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         if self.items.is_empty() {
-            // Close the window when there's no active items to close, if configured
+            // Close the window when there's no active items to close, if configured.
             if WorkspaceSettings::get_global(cx)
                 .when_closing_with_no_tabs
                 .should_close()
             {
                 window.dispatch_action(Box::new(CloseWindow), cx);
             }
-
             return Task::ready(Ok(()));
         }
         if self.is_tab_pinned(self.active_item_index) && !action.close_pinned {
