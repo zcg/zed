@@ -1270,15 +1270,19 @@ pub enum FontStyleContent {
     Oblique,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize, MergeFrom)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    MergeFrom,
+    derive_more::FromStr,
+)]
 #[serde(transparent)]
 pub struct FontWeightContent(pub f32);
-
-impl From<f32> for FontWeightContent {
-    fn from(value: f32) -> Self {
-        Self(value)
-    }
-}
 
 impl Display for FontWeightContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1286,12 +1290,9 @@ impl Display for FontWeightContent {
     }
 }
 
-impl FromStr for FontWeightContent {
-    type Err = std::num::ParseFloatError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value = s.parse::<f32>()?;
-        Ok(Self(value))
+impl From<f32> for FontWeightContent {
+    fn from(weight: f32) -> Self {
+        FontWeightContent(weight)
     }
 }
 
