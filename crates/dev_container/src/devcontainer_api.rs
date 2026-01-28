@@ -961,7 +961,6 @@ async fn devcontainer_up_remote(
         }
     }
 }
-
 async fn devcontainer_read_configuration(
     path_to_cli: &PathBuf,
     found_in_path: bool,
@@ -1002,7 +1001,6 @@ async fn devcontainer_read_configuration(
         }
     }
 }
-
 async fn devcontainer_read_configuration_remote(
     remote_options: &RemoteConnectionOptions,
     path: &Arc<Path>,

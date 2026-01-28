@@ -146,15 +146,15 @@ enum AgentServerStoreState {
     Collab,
 }
 
-struct ExternalAgentEntry {
+pub struct ExternalAgentEntry {
     server: Box<dyn ExternalAgentServer>,
     icon: Option<SharedString>,
     display_name: Option<SharedString>,
-    source: ExternalAgentSource,
+    pub source: ExternalAgentSource,
 }
 
 impl ExternalAgentEntry {
-    fn new(
+    pub fn new(
         server: Box<dyn ExternalAgentServer>,
         source: ExternalAgentSource,
         icon: Option<SharedString>,
@@ -171,7 +171,7 @@ impl ExternalAgentEntry {
 
 pub struct AgentServerStore {
     state: AgentServerStoreState,
-    external_agents: HashMap<ExternalAgentServerName, ExternalAgentEntry>,
+    pub external_agents: HashMap<ExternalAgentServerName, ExternalAgentEntry>,
 }
 
 pub struct AgentServersUpdated;
