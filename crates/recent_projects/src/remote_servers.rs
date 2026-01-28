@@ -444,9 +444,16 @@ fn devcontainer_error_hints(message: &str) -> Vec<String> {
             "Run the commands on the host where the project lives.",
             &mut hints,
         );
+        push_hint(
+            "Ensure npm is installed on the project host: npm --version",
+            &mut hints,
+        );
     }
 
-    if message.contains("Docker CLI not found")
+    if message_lower.contains("docker/podman not available")
+        || message_lower.contains("docker info failed")
+        || message_lower.contains("podman info failed")
+        || message.contains("Docker CLI not found")
         || message_lower.contains("docker cli not available")
         || message_lower.contains("unable to run docker")
     {
@@ -456,6 +463,10 @@ fn devcontainer_error_hints(message: &str) -> Vec<String> {
         );
         push_hint(
             "Verify it is available: docker --version (or podman --version).",
+            &mut hints,
+        );
+        push_hint(
+            "Verify the daemon is running: docker info (or podman info).",
             &mut hints,
         );
         push_hint(
@@ -4254,6 +4265,7 @@ impl RemoteServerProjects {
         cx.spawn_in(window, async move |_, cx| {
             let mut missing = Vec::new();
             let mut unknown = 0usize;
+            let mut docker_unavailable = 0usize;
             let executor = cx.background_executor().clone();
             let mut probes = futures::stream::iter(connections.into_iter().map(|connection| {
                 let executor = executor.clone();
@@ -4273,6 +4285,9 @@ impl RemoteServerProjects {
                     DevContainerProbe::Missing => {
                         missing.push(DevContainerKey::from_connection(&connection));
                     }
+                    DevContainerProbe::DockerUnavailable => {
+                        docker_unavailable += 1;
+                    }
                     DevContainerProbe::Unknown => {
                         unknown += 1;
                     }
@@ -4288,17 +4303,35 @@ impl RemoteServerProjects {
             }
 
             if notify {
-                let message = if unknown > 0 && missing_count == 0 {
-                    format!("Could not verify {unknown} dev container(s).")
-                } else if missing_count > 0 {
-                    if unknown > 0 {
+                let message = if missing_count > 0 {
+                    if unknown > 0 && docker_unavailable > 0 {
+                        format!(
+                            "Removed {} stale dev container(s). {unknown} could not be verified. Docker unavailable for {docker_unavailable}.",
+                            missing_count
+                        )
+                    } else if unknown > 0 {
                         format!(
                             "Removed {} stale dev container(s). {unknown} could not be verified.",
+                            missing_count
+                        )
+                    } else if docker_unavailable > 0 {
+                        format!(
+                            "Removed {} stale dev container(s). Docker unavailable for {docker_unavailable}.",
                             missing_count
                         )
                     } else {
                         format!("Removed {} stale dev container(s).", missing_count)
                     }
+                } else if docker_unavailable > 0 {
+                    if unknown > 0 {
+                        format!(
+                            "Docker unavailable for {docker_unavailable} dev container(s). {unknown} could not be verified."
+                        )
+                    } else {
+                        format!("Docker unavailable for {docker_unavailable} dev container(s).")
+                    }
+                } else if unknown > 0 {
+                    format!("Could not verify {unknown} dev container(s).")
                 } else {
                     "Dev containers are up to date.".to_string()
                 };
@@ -8347,6 +8380,7 @@ impl Render for RemoteServerProjects {
 enum DevContainerProbe {
     Exists,
     Missing,
+    DockerUnavailable,
     Unknown,
 }
 
@@ -8428,14 +8462,14 @@ async fn probe_dev_container(connection: &DevContainerConnection) -> DevContaine
             let message = output_message(&output);
             let message = message.to_lowercase();
             if is_docker_unavailable_output(&message) {
-                DevContainerProbe::Unknown
+                DevContainerProbe::DockerUnavailable
             } else if is_missing_container_output(&message, &connection.container_id) {
                 DevContainerProbe::Missing
             } else {
                 DevContainerProbe::Unknown
             }
         }
-        Err(_) => DevContainerProbe::Unknown,
+        Err(_) => DevContainerProbe::DockerUnavailable,
     }
 }
 
