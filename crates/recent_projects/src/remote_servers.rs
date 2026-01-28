@@ -7526,7 +7526,12 @@ impl RemoteServerProjects {
                     .is_some()
             })
             .unwrap_or(false);
-        let dev_container_disabled = !has_open_project;
+        let is_local = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().read(cx).is_local())
+            .unwrap_or(true);
+        let dev_container_disabled = !has_open_project || !is_local;
 
         let connect_dev_container_button = div()
             .id("connect-new-dev-container")
@@ -8051,7 +8056,7 @@ impl RemoteServerProjects {
 
         if selected_tab == RemoteProjectsTab::DevContainers {
             modal_section = modal_section.entry(state.refresh_devcontainer.clone());
-            if has_open_project {
+            if has_open_project && is_local {
                 modal_section = modal_section.entry(state.add_new_devcontainer.clone());
             }
         }
