@@ -424,12 +424,12 @@ fn devcontainer_error_hints(message: &str) -> Vec<String> {
         || message_lower.contains("devcontainer cli")
     {
         push_hint(
-            "Install the Dev Container CLI on the project host (WSL/SSH): npm install -g @devcontainers/cli",
+            "Install the Dev Container CLI on the project host: npm install -g @devcontainers/cli",
             &mut hints,
         );
         push_hint("Verify it is on PATH: devcontainer --version", &mut hints);
         push_hint(
-            "Quick WSL check: wsl -d <distro> -- sh -lc 'command -v devcontainer'",
+            "Quick WSL check (if applicable): wsl -d <distro> -- sh -lc 'command -v devcontainer'",
             &mut hints,
         );
         push_hint(
@@ -441,7 +441,7 @@ fn devcontainer_error_hints(message: &str) -> Vec<String> {
             &mut hints,
         );
         push_hint(
-            "Run the commands on the host where the project lives, not on Windows.",
+            "Run the commands on the host where the project lives.",
             &mut hints,
         );
     }
@@ -459,7 +459,7 @@ fn devcontainer_error_hints(message: &str) -> Vec<String> {
             &mut hints,
         );
         push_hint(
-            "Run the commands on the host where the project lives, not on Windows.",
+            "Run the commands on the host where the project lives.",
             &mut hints,
         );
     }
@@ -484,13 +484,6 @@ fn devcontainer_error_hints(message: &str) -> Vec<String> {
     {
         push_hint(
             "Ensure the container has outbound internet access and curl or wget installed.",
-            &mut hints,
-        );
-    }
-
-    if message.contains("Dev Containers are only supported for local, WSL, or SSH projects") {
-        push_hint(
-            "Open the project as Local, WSL, or SSH before creating a dev container.",
             &mut hints,
         );
     }

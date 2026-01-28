@@ -10,7 +10,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::io::AsyncBufReadExt;
 use gpui::AsyncWindowContext;
 use node_runtime::NodeRuntime;
-use remote::RemoteConnectionOptions;
+use remote::{DockerConnectionOptions, DockerHost, RemoteConnectionOptions};
 use serde::Deserialize;
 use settings::{DevContainerConnection, DevContainerHost, Settings as _};
 use smol::{fs, io::BufReader, process::Command};
@@ -26,6 +26,14 @@ struct DevContainerUp {
     container_id: String,
     _remote_user: String,
     remote_workspace_folder: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerMount {
+    #[serde(rename = "Destination")]
+    destination: String,
+    #[serde(rename = "Source")]
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,7 +63,6 @@ pub enum DevContainerError {
     DevContainerParseFailed,
     NodeRuntimeNotAvailable,
     NotInValidProject,
-    RemoteConnectionNotSupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,10 +117,6 @@ impl Display for DevContainerError {
                 DevContainerError::NodeRuntimeNotAvailable =>
                     "Cannot find a valid node runtime".to_string(),
                 DevContainerError::NotInValidProject => "Not within a valid project".to_string(),
-                DevContainerError::RemoteConnectionNotSupported => {
-                    "Dev Containers are only supported for local, WSL, or SSH projects"
-                        .to_string()
-                }
             }
         )
     }
@@ -128,23 +131,15 @@ pub(crate) async fn read_devcontainer_configuration_for_project(
     cx: &mut AsyncWindowContext,
     node_runtime: &NodeRuntime,
 ) -> Result<DevContainerConfigurationOutput, DevContainerError> {
-    let Some(ProjectContext {
+    let use_podman = use_podman(cx);
+    let ProjectContext {
         directory,
         remote_options,
-    }) = project_context(cx)
-    else {
-        return Err(DevContainerError::NotInValidProject);
-    };
+    } = resolve_project_context_for_devcontainer(cx).await?;
 
     if let Some(remote_options) = remote_options {
-        match remote_options {
-            RemoteConnectionOptions::Ssh(_) | RemoteConnectionOptions::Wsl(_) => {
-                ensure_devcontainer_cli_remote(&remote_options).await?;
-                devcontainer_read_configuration_remote(&remote_options, &directory, use_podman(cx))
-                    .await
-            }
-            _ => Err(DevContainerError::RemoteConnectionNotSupported),
-        }
+        ensure_devcontainer_cli_remote(&remote_options).await?;
+        devcontainer_read_configuration_remote(&remote_options, &directory, use_podman).await
     } else {
         let (path_to_devcontainer_cli, found_in_path) =
             ensure_devcontainer_cli(&node_runtime).await?;
@@ -153,7 +148,7 @@ pub(crate) async fn read_devcontainer_configuration_for_project(
             found_in_path,
             node_runtime,
             &directory,
-            use_podman(cx),
+            use_podman,
         )
         .await
     }
@@ -166,29 +161,21 @@ pub(crate) async fn apply_dev_container_template(
     cx: &mut AsyncWindowContext,
     node_runtime: &NodeRuntime,
 ) -> Result<DevContainerApply, DevContainerError> {
-    let Some(ProjectContext {
+    let ProjectContext {
         directory,
         remote_options,
-    }) = project_context(cx)
-    else {
-        return Err(DevContainerError::NotInValidProject);
-    };
+    } = resolve_project_context_for_devcontainer(cx).await?;
 
     if let Some(remote_options) = remote_options {
-        match remote_options {
-            RemoteConnectionOptions::Ssh(_) | RemoteConnectionOptions::Wsl(_) => {
-                ensure_devcontainer_cli_remote(&remote_options).await?;
-                devcontainer_template_apply_remote(
-                    template,
-                    options_selected,
-                    features_selected,
-                    &remote_options,
-                    &directory,
-                )
-                .await
-            }
-            _ => Err(DevContainerError::RemoteConnectionNotSupported),
-        }
+        ensure_devcontainer_cli_remote(&remote_options).await?;
+        devcontainer_template_apply_remote(
+            template,
+            options_selected,
+            features_selected,
+            &remote_options,
+            &directory,
+        )
+        .await
     } else {
         let (path_to_devcontainer_cli, found_in_path) =
             ensure_devcontainer_cli(&node_runtime).await?;
@@ -243,137 +230,123 @@ pub async fn start_dev_container_with_progress(
         };
 
     let use_podman = use_podman(cx);
-    let Some(ProjectContext {
+    let ProjectContext {
         directory,
         remote_options,
-    }) = project_context(cx)
-    else {
-        return Err(DevContainerError::NotInValidProject);
-    };
+    } = resolve_project_context_for_devcontainer(cx).await?;
 
     if let Some(remote_options) = remote_options {
-        match remote_options {
-            RemoteConnectionOptions::Ssh(_) | RemoteConnectionOptions::Wsl(_) => {
-                send_progress(
-                    DevContainerProgressEvent::StepStarted(DevContainerBuildStep::CheckDocker),
-                    &progress_tx,
-                );
-                log_info("Checking Docker/Podman availability...", &progress_tx);
-                if let Err(e) = check_for_docker_remote(&remote_options, use_podman).await {
-                    send_progress(
-                        DevContainerProgressEvent::StepFailed(
-                            DevContainerBuildStep::CheckDocker,
-                            e.to_string(),
-                        ),
-                        &progress_tx,
-                    );
-                    return Err(e);
-                }
-                send_progress(
-                    DevContainerProgressEvent::StepCompleted(DevContainerBuildStep::CheckDocker),
-                    &progress_tx,
-                );
-
-                send_progress(
-                    DevContainerProgressEvent::StepStarted(
-                        DevContainerBuildStep::CheckDevcontainerCli,
-                    ),
-                    &progress_tx,
-                );
-                log_info("Checking Dev Container CLI...", &progress_tx);
-                if let Err(e) = ensure_devcontainer_cli_remote(&remote_options).await {
-                    send_progress(
-                        DevContainerProgressEvent::StepFailed(
-                            DevContainerBuildStep::CheckDevcontainerCli,
-                            e.to_string(),
-                        ),
-                        &progress_tx,
-                    );
-                    return Err(e);
-                }
-                send_progress(
-                    DevContainerProgressEvent::StepCompleted(
-                        DevContainerBuildStep::CheckDevcontainerCli,
-                    ),
-                    &progress_tx,
-                );
-
-                send_progress(
-                    DevContainerProgressEvent::StepStarted(DevContainerBuildStep::DevcontainerUp),
-                    &progress_tx,
-                );
-                log_info("Running devcontainer up...", &progress_tx);
-                let DevContainerUp {
-                    container_id,
-                    remote_workspace_folder,
-                    ..
-                } = match devcontainer_up_remote(
-                    &remote_options,
-                    &directory,
-                    use_podman,
-                    progress_tx.as_ref(),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        send_progress(
-                            DevContainerProgressEvent::StepFailed(
-                                DevContainerBuildStep::DevcontainerUp,
-                                e.to_string(),
-                            ),
-                            &progress_tx,
-                        );
-                        return Err(e);
-                    }
-                };
-                send_progress(
-                    DevContainerProgressEvent::StepCompleted(DevContainerBuildStep::DevcontainerUp),
-                    &progress_tx,
-                );
-
-                send_progress(
-                    DevContainerProgressEvent::StepStarted(
-                        DevContainerBuildStep::ReadConfiguration,
-                    ),
-                    &progress_tx,
-                );
-                log_info("Reading devcontainer configuration...", &progress_tx);
-                let project_name = match devcontainer_read_configuration_remote(
-                    &remote_options,
-                    &directory,
-                    use_podman,
-                )
-                .await
-                {
-                    Ok(DevContainerConfigurationOutput {
-                        configuration:
-                            DevContainerConfiguration {
-                                name: Some(project_name),
-                            },
-                    }) => project_name,
-                    _ => get_backup_project_name(&remote_workspace_folder, &container_id),
-                };
-                send_progress(
-                    DevContainerProgressEvent::StepCompleted(
-                        DevContainerBuildStep::ReadConfiguration,
-                    ),
-                    &progress_tx,
-                );
-
-                let connection = DevContainerConnection {
-                    name: project_name,
-                    container_id,
-                    use_podman,
-                    projects: BTreeSet::new(),
-                    host_projects: BTreeSet::new(),
-                    host: devcontainer_host_from_remote_options(&remote_options),
-                };
-
-                Ok((connection, remote_workspace_folder))
-            }
-            _ => Err(DevContainerError::RemoteConnectionNotSupported),
+        send_progress(
+            DevContainerProgressEvent::StepStarted(DevContainerBuildStep::CheckDocker),
+            &progress_tx,
+        );
+        log_info("Checking Docker/Podman availability...", &progress_tx);
+        if let Err(e) = check_for_docker_remote(&remote_options, use_podman).await {
+            send_progress(
+                DevContainerProgressEvent::StepFailed(
+                    DevContainerBuildStep::CheckDocker,
+                    e.to_string(),
+                ),
+                &progress_tx,
+            );
+            return Err(e);
         }
+        send_progress(
+            DevContainerProgressEvent::StepCompleted(DevContainerBuildStep::CheckDocker),
+            &progress_tx,
+        );
+
+        send_progress(
+            DevContainerProgressEvent::StepStarted(DevContainerBuildStep::CheckDevcontainerCli),
+            &progress_tx,
+        );
+        log_info("Checking Dev Container CLI...", &progress_tx);
+        if let Err(e) = ensure_devcontainer_cli_remote(&remote_options).await {
+            send_progress(
+                DevContainerProgressEvent::StepFailed(
+                    DevContainerBuildStep::CheckDevcontainerCli,
+                    e.to_string(),
+                ),
+                &progress_tx,
+            );
+            return Err(e);
+        }
+        send_progress(
+            DevContainerProgressEvent::StepCompleted(
+                DevContainerBuildStep::CheckDevcontainerCli,
+            ),
+            &progress_tx,
+        );
+
+        send_progress(
+            DevContainerProgressEvent::StepStarted(DevContainerBuildStep::DevcontainerUp),
+            &progress_tx,
+        );
+        log_info("Running devcontainer up...", &progress_tx);
+        let DevContainerUp {
+            container_id,
+            remote_workspace_folder,
+            ..
+        } = match devcontainer_up_remote(
+            &remote_options,
+            &directory,
+            use_podman,
+            progress_tx.as_ref(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                send_progress(
+                    DevContainerProgressEvent::StepFailed(
+                        DevContainerBuildStep::DevcontainerUp,
+                        e.to_string(),
+                    ),
+                    &progress_tx,
+                );
+                return Err(e);
+            }
+        };
+        send_progress(
+            DevContainerProgressEvent::StepCompleted(DevContainerBuildStep::DevcontainerUp),
+            &progress_tx,
+        );
+
+        send_progress(
+            DevContainerProgressEvent::StepStarted(DevContainerBuildStep::ReadConfiguration),
+            &progress_tx,
+        );
+        log_info("Reading devcontainer configuration...", &progress_tx);
+        let project_name = match devcontainer_read_configuration_remote(
+            &remote_options,
+            &directory,
+            use_podman,
+        )
+        .await
+        {
+            Ok(DevContainerConfigurationOutput {
+                configuration:
+                    DevContainerConfiguration {
+                        name: Some(project_name),
+                    },
+            }) => project_name,
+            _ => get_backup_project_name(&remote_workspace_folder, &container_id),
+        };
+        send_progress(
+            DevContainerProgressEvent::StepCompleted(DevContainerBuildStep::ReadConfiguration),
+            &progress_tx,
+        );
+
+        let connection = DevContainerConnection {
+            name: project_name,
+            container_id,
+            use_podman,
+            projects: BTreeSet::new(),
+            host_projects: BTreeSet::new(),
+            host: devcontainer_host_from_remote_options(&remote_options),
+        };
+
+        Ok((connection, remote_workspace_folder))
     } else {
         send_progress(
             DevContainerProgressEvent::StepStarted(DevContainerBuildStep::CheckDocker),
@@ -509,6 +482,10 @@ fn dev_container_script() -> &'static str {
     "devcontainer.js"
 }
 
+fn docker_cli_name(use_podman: bool) -> &'static str {
+    if use_podman { "podman" } else { "docker" }
+}
+
 fn devcontainer_host_from_remote_options(
     options: &RemoteConnectionOptions,
 ) -> Option<DevContainerHost> {
@@ -595,7 +572,9 @@ fn build_remote_shell_command(
             command.args(ssh_args);
             Ok(command)
         }
-        _ => Err(DevContainerError::RemoteConnectionNotSupported),
+        _ => Err(DevContainerError::DevContainerUpFailed(
+            "Unsupported remote connection for devcontainer command".to_string(),
+        )),
     }
 }
 
@@ -688,7 +667,9 @@ fn build_remote_command(
             command.args(ssh_args);
             Ok(command)
         }
-        _ => Err(DevContainerError::RemoteConnectionNotSupported),
+        _ => Err(DevContainerError::DevContainerUpFailed(
+            "Unsupported remote connection for devcontainer command".to_string(),
+        )),
     }
 }
 
@@ -1139,6 +1120,27 @@ fn parse_json_from_cli<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, D
         })
 }
 
+fn parse_json_array_from_cli<T: serde::de::DeserializeOwned>(
+    raw: &str,
+) -> Result<T, DevContainerError> {
+    serde_json::from_str::<T>(raw).or_else(|e| {
+        log::error!("Error parsing json: {} - will try to find json array in larger plaintext", e);
+        let json_start = raw.find('[').ok_or_else(|| {
+            log::error!("No JSON array found in docker inspect output");
+            DevContainerError::DevContainerParseFailed
+        })?;
+
+        serde_json::from_str(&raw[json_start..]).map_err(|e| {
+            log::error!(
+                "Unable to parse JSON array from docker inspect output (starting at position {}), error: {:?}",
+                json_start,
+                e
+            );
+            DevContainerError::DevContainerParseFailed
+        })
+    })
+}
+
 async fn devcontainer_template_apply_remote(
     template: &DevContainerTemplate,
     template_options: &HashMap<String, String>,
@@ -1333,6 +1335,181 @@ fn project_context(cx: &mut AsyncWindowContext) -> Option<ProjectContext> {
             None
         }
     }
+}
+
+async fn resolve_project_context_for_devcontainer(
+    cx: &mut AsyncWindowContext,
+) -> Result<ProjectContext, DevContainerError> {
+    let Some(ProjectContext {
+        directory,
+        remote_options,
+    }) = project_context(cx)
+    else {
+        return Err(DevContainerError::NotInValidProject);
+    };
+
+    let Some(remote_options) = remote_options else {
+        return Ok(ProjectContext {
+            directory,
+            remote_options: None,
+        });
+    };
+
+    match remote_options {
+        RemoteConnectionOptions::Docker(options) => {
+            resolve_docker_project_context(directory, options).await
+        }
+        _ => Ok(ProjectContext {
+            directory,
+            remote_options: Some(remote_options),
+        }),
+    }
+}
+
+async fn resolve_docker_project_context(
+    directory: Arc<Path>,
+    options: DockerConnectionOptions,
+) -> Result<ProjectContext, DevContainerError> {
+    let host_remote_options = remote_options_for_docker_host(&options.host);
+    let host_directory =
+        resolve_host_directory_for_docker(&host_remote_options, &options, &directory).await?;
+
+    Ok(ProjectContext {
+        directory: host_directory,
+        remote_options: host_remote_options,
+    })
+}
+
+fn remote_options_for_docker_host(host: &DockerHost) -> Option<RemoteConnectionOptions> {
+    match host {
+        DockerHost::Local => None,
+        DockerHost::Wsl(options) => Some(RemoteConnectionOptions::Wsl(options.clone())),
+        DockerHost::Ssh(options) => Some(RemoteConnectionOptions::Ssh(options.clone())),
+    }
+}
+
+async fn resolve_host_directory_for_docker(
+    host_remote_options: &Option<RemoteConnectionOptions>,
+    options: &DockerConnectionOptions,
+    container_directory: &Arc<Path>,
+) -> Result<Arc<Path>, DevContainerError> {
+    let mounts =
+        docker_inspect_mounts(host_remote_options, &options.container_id, options.use_podman)
+            .await?;
+    let container_path = container_directory.display().to_string();
+    let host_path = host_path_from_mounts(&mounts, &container_path)?;
+    Ok(Arc::from(PathBuf::from(host_path)))
+}
+
+async fn docker_inspect_mounts(
+    host_remote_options: &Option<RemoteConnectionOptions>,
+    container_id: &str,
+    use_podman: bool,
+) -> Result<Vec<DockerMount>, DevContainerError> {
+    let args = vec![
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{json .Mounts}}".to_string(),
+        container_id.to_string(),
+    ];
+    let mut command = build_host_docker_command(host_remote_options, use_podman, &args)?;
+
+    match command.output().await {
+        Ok(output) if output.status.success() => {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            parse_json_array_from_cli::<Vec<DockerMount>>(&raw)
+        }
+        Ok(output) => {
+            let message = format!(
+                "Non-success status running docker inspect for container: out: {:?}, err: {:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            log::error!("{}", &message);
+            Err(DevContainerError::DevContainerUpFailed(message))
+        }
+        Err(e) => {
+            let message = format!("Error running docker inspect: {:?}", e);
+            log::error!("{}", &message);
+            Err(DevContainerError::DevContainerUpFailed(message))
+        }
+    }
+}
+
+fn build_host_docker_command(
+    host_remote_options: &Option<RemoteConnectionOptions>,
+    use_podman: bool,
+    args: &[String],
+) -> Result<Command, DevContainerError> {
+    let docker_cli = docker_cli_name(use_podman);
+    if let Some(remote_options) = host_remote_options {
+        build_remote_command(remote_options, docker_cli, args, false)
+    } else {
+        let mut command = util::command::new_smol_command(docker_cli);
+        command.args(args);
+        Ok(command)
+    }
+}
+
+fn host_path_from_mounts(
+    mounts: &[DockerMount],
+    container_path: &str,
+) -> Result<String, DevContainerError> {
+    let container_path = trim_trailing_slash(container_path);
+    let mut best: Option<(&DockerMount, &str)> = None;
+
+    for mount in mounts {
+        let destination = trim_trailing_slash(&mount.destination);
+        let rest = container_path.strip_prefix(destination);
+        let is_match = match rest {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        };
+        if is_match {
+            let replace = best
+                .as_ref()
+                .map_or(true, |(_, best_dest)| destination.len() > best_dest.len());
+            if replace {
+                best = Some((mount, destination));
+            }
+        }
+    }
+
+    let Some((mount, destination)) = best else {
+        return Err(DevContainerError::DevContainerUpFailed(
+            "Unable to resolve host workspace path for dev container".to_string(),
+        ));
+    };
+
+    let suffix = container_path.strip_prefix(destination).unwrap_or("");
+    Ok(join_host_path(&mount.source, suffix))
+}
+
+fn trim_trailing_slash(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(&['/', '\\'][..]);
+    if trimmed.is_empty() { path } else { trimmed }
+}
+
+fn join_host_path(source: &str, suffix: &str) -> String {
+    let source = trim_trailing_slash(source);
+    let suffix = suffix.trim_start_matches(&['/', '\\'][..]);
+    if suffix.is_empty() {
+        return source.to_string();
+    }
+
+    let is_windows = source.contains('\\') || source.contains(':');
+    let sep = if is_windows { '\\' } else { '/' };
+    let mut base = source.to_string();
+    if !base.ends_with(sep) && !base.ends_with('/') && !base.ends_with('\\') {
+        base.push(sep);
+    }
+    let tail = if is_windows {
+        suffix.replace('/', "\\")
+    } else {
+        suffix.to_string()
+    };
+    base.push_str(&tail);
+    base
 }
 
 fn template_features_to_json(features_selected: &HashSet<DevContainerFeature>) -> String {
