@@ -180,7 +180,7 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        let copilot = window.root::<Workspace>().flatten().and_then(|workspace| {
+        let _copilot = window.root::<Workspace>().flatten().and_then(|workspace| {
             let (project, app_state) = {
                 let workspace = workspace.read(cx);
                 (workspace.project().clone(), workspace.app_state().clone())
@@ -200,7 +200,6 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
                         .unwrap_or(false)
                 },
                 copilot_ui::ConfigurationMode::Chat,
-                copilot,
                 cx,
             )
         })

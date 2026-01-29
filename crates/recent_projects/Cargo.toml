@@ -26,6 +26,7 @@ editor.workspace = true
 extension_host.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
+file_finder.workspace = true
 gpui.workspace = true
 language.workspace = true
 log.workspace = true

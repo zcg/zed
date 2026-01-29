@@ -638,7 +638,7 @@ impl NodeRuntimeTrait for ManagedNodeRuntime {
         args: &[&str],
     ) -> Result<NpmCommand> {
         let node_binary = self.installation_path.join(Self::NODE_PATH);
-        let npm_file = self.installation_path.join(Self::NPM_PATH);
+        let npm_file = Self::resolve_npm_path(&self.installation_path).await?;
 
         anyhow::ensure!(
             smol::fs::metadata(&node_binary).await.is_ok(),

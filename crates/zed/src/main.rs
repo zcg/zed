@@ -17,7 +17,6 @@ use crashes::InitCrashHandler;
 use db::kvp::{GLOBAL_KEY_VALUE_STORE, KEY_VALUE_STORE};
 use editor::Editor;
 use extension::ExtensionHostProxy;
-use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use fs::{Fs, RealFs};
 use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;

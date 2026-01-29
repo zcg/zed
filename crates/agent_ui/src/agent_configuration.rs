@@ -15,7 +15,6 @@ use context_server::ContextServerId;
 use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use extension::ExtensionManifest;
 use extension_host::ExtensionStore;
-use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
 use gpui::{
     Action, AnyView, App, AsyncWindowContext, Corner, Entity, EventEmitter, FocusHandle, Focusable,

@@ -697,13 +697,32 @@ echo "/tmp"
 
     fn kill_inner(&self) -> Result<()> {
         if let Some(pid) = self.proxy_process.lock().take() {
-            if let Ok(_) = util::command::new_smol_command("kill")
-                .arg(pid.to_string())
-                .spawn()
+            #[cfg(target_os = "windows")]
             {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("Failed to kill process"))
+                let status = util::command::new_std_command("taskkill")
+                    .arg("/PID")
+                    .arg(pid.to_string())
+                    .arg("/T")
+                    .arg("/F")
+                    .status();
+                if status.map(|s| s.success()).unwrap_or(false) {
+                    Ok(())
+                } else {
+                    // If the process is already gone or we can't kill it, don't fail reconnect.
+                    Ok(())
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if util::command::new_smol_command("kill")
+                    .arg(pid.to_string())
+                    .spawn()
+                    .is_ok()
+                {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Failed to kill process"))
+                }
             }
         } else {
             Ok(())

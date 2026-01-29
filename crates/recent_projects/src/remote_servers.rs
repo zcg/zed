@@ -818,7 +818,8 @@ impl ProjectPicker {
             let picker = Picker::uniform_list(delegate, window, cx)
                 .width(rems(34.))
                 .modal(false);
-            picker.set_query(home_dir.to_string(), window, cx);
+            let query = home_dir.to_string();
+            picker.set_query(&query, window, cx);
             picker
         });
 
@@ -1390,7 +1391,7 @@ enum ViewServerOptionsState {
     DevContainer {
         connection: DevContainerConnection,
         server_index: DevContainerIndex,
-        entries: [NavigableEntry; 8],
+        entries: [NavigableEntry; 6],
     },
 }
 
@@ -2710,13 +2711,27 @@ impl RemoteServerProjects {
                         args: options.args.unwrap_or_default(),
                     }),
                 };
+                let mut projects = Default::default();
+                let mut host_projects = Default::default();
+                if let Some(saved) = RemoteSettings::get_global(cx)
+                    .dev_container_connections()
+                    .nth(server_index.0)
+                {
+                    if saved.container_id == connection.container_id
+                        && saved.use_podman == connection.use_podman
+                        && saved.host == host
+                    {
+                        projects = saved.projects.clone();
+                        host_projects = saved.host_projects.clone();
+                    }
+                }
                 ViewServerOptionsState::DevContainer {
                     connection: DevContainerConnection {
                         name: connection.name,
                         container_id: connection.container_id,
                         use_podman: connection.use_podman,
-                        projects: Default::default(),
-                        host_projects: Default::default(),
+                        projects,
+                        host_projects,
                         host,
                     },
                     server_index,
@@ -3831,64 +3846,19 @@ impl RemoteServerProjects {
             cx,
         );
 
-        cx.spawn_in(window, async move |_, cx| {
-            if confirmation.await.ok() == Some(0) {
-                let has_host_paths =
-                    RemoteServerProjects::host_project_paths(&connection).is_some();
-                remote_servers
-                    .update_in(cx, |this, window, cx| {
-                        if has_host_paths || connection.host.is_none() {
-                            this.return_to_host_folder(&connection, window, cx);
-                        } else {
-                            let disconnected =
-                                this.disconnect_active_dev_container(&connection, false, cx);
-                            if disconnected {
-                                this.show_devcontainer_toast(
-                                    format!("Disconnected from `{}`.", name),
-                                    cx,
-                                );
-                            } else {
-                                this.show_devcontainer_toast(
-                                    format!("No active connection to `{}`.", name),
-                                    cx,
-                                );
-                            }
-                        }
-                    })
-                    .ok();
-            }
-            anyhow::Ok(())
-        })
-        .detach();
-    }
-
-    fn prompt_return_to_host_folder(
-        remote_servers: Entity<RemoteServerProjects>,
-        name: SharedString,
-        connection: DevContainerConnection,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let prompt_message = format!("Return to the host folder from `{}`?", name);
-        let confirmation = window.prompt(
-            PromptLevel::Warning,
-            &prompt_message,
-            Some("This will close the dev container workspace in this window."),
-            &["Return", "Cancel"],
-            cx,
-        );
-
-        cx.spawn_in(window, async move |_, cx| {
+        window
+            .spawn(cx, async move |cx| {
             if confirmation.await.ok() == Some(0) {
                 remote_servers
                     .update_in(cx, |this, window, cx| {
+                        this.disconnect_active_dev_container(&connection, false, cx);
                         this.return_to_host_folder(&connection, window, cx);
                     })
                     .ok();
             }
             anyhow::Ok(())
         })
-        .detach();
+            .detach();
     }
 
     fn prompt_stop_dev_container(
@@ -3997,6 +3967,28 @@ impl RemoteServerProjects {
             .map(|project| project.paths.iter().map(PathBuf::from).collect())
     }
 
+    fn host_project_paths_from_settings(
+        connection: &DevContainerConnection,
+        cx: &App,
+    ) -> Option<Vec<PathBuf>> {
+        RemoteSettings::get_global(cx)
+            .dev_container_connections()
+            .find_map(|saved| {
+                if saved.container_id == connection.container_id
+                    && saved.use_podman == connection.use_podman
+                    && saved.host == connection.host
+                {
+                    saved
+                        .host_projects
+                        .iter()
+                        .next()
+                        .map(|project| project.paths.iter().map(PathBuf::from).collect())
+                } else {
+                    None
+                }
+            })
+    }
+
     fn host_connection_options(
         connection: &DevContainerConnection,
     ) -> Option<RemoteConnectionOptions> {
@@ -4033,7 +4025,10 @@ impl RemoteServerProjects {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let Some(paths) = Self::host_project_paths(connection) else {
+        let old_window = window.window_handle();
+        let Some(paths) = Self::host_project_paths(connection)
+            .or_else(|| Self::host_project_paths_from_settings(connection, cx))
+        else {
             if connection.host.is_none() {
                 self.return_to_local_folder(window, cx);
             } else {
@@ -4043,13 +4038,7 @@ impl RemoteServerProjects {
         };
 
         if let Some(connection_options) = Self::host_connection_options(connection) {
-            let Some(app_state) = workspace
-                .read_with(cx, |workspace, _| workspace.app_state().clone())
-                .log_err()
-            else {
-                return;
-            };
-            let replace_window = window.window_handle().downcast::<Workspace>();
+            let app_state = workspace.read_with(cx, |workspace, _| workspace.app_state().clone());
             let remote_servers = cx.entity();
             cx.spawn_in(window, async move |_, cx| {
                 let result = open_remote_project(
@@ -4057,7 +4046,7 @@ impl RemoteServerProjects {
                     paths,
                     app_state,
                     OpenOptions {
-                        replace_window,
+                        replace_window: None,
                         ..Default::default()
                     },
                     cx,
@@ -4071,6 +4060,8 @@ impl RemoteServerProjects {
                             cx,
                         );
                     });
+                } else {
+                    let _ = old_window.update(cx, |_, window, _| window.remove_window());
                 }
                 anyhow::Ok(())
             })
@@ -4601,7 +4592,7 @@ impl RemoteServerProjects {
             if path.starts_with('/') {
                 return Some(path);
             }
-            if let Some(wsl_path) = wsl_unc_path_to_posix(&path, distro_name) {
+            if let Some(wsl_path) = Self::wsl_unc_path_to_posix(&path, distro_name) {
                 return Some(wsl_path);
             }
             let options = WslConnectionOptions {
@@ -4923,7 +4914,10 @@ impl RemoteServerProjects {
                                     }
                                 }))
                                 .child(
-                                    CopyButton::new(build_state.log_contents.clone())
+                                    CopyButton::new(
+                                        "devcontainer-progress-copy-button",
+                                        build_state.log_contents.clone(),
+                                    )
                                         .tooltip_label("Copy logs"),
                                 ),
                         )
@@ -7036,7 +7030,7 @@ impl RemoteServerProjects {
                             .inset(true)
                             .spacing(ui::ListItemSpacing::Sparse)
                             .start_slot(Icon::new(IconName::Disconnected).color(Color::Muted))
-                            .child(Label::new("Disconnect Dev Container"))
+                            .child(Label::new("Disconnect and Return to Host"))
                             .on_click(cx.listener({
                                 let connection_name = connection_name.clone();
                                 let connection = connection_for_disconnect.clone();
@@ -7055,49 +7049,8 @@ impl RemoteServerProjects {
             })
             .child({
                 div()
-                    .id("devcontainer-options-return-host")
-                    .track_focus(&entries[4].focus_handle)
-                    .on_action(cx.listener({
-                        let connection_name = connection_name.clone();
-                        let connection = connection.clone();
-                        move |_, _: &menu::Confirm, window, cx| {
-                            Self::prompt_return_to_host_folder(
-                                cx.entity(),
-                                connection_name.clone(),
-                                connection.clone(),
-                                window,
-                                cx,
-                            );
-                            cx.focus_self(window);
-                        }
-                    }))
-                    .child(
-                        ListItem::new("return-host-devcontainer")
-                            .toggle_state(entries[4].focus_handle.contains_focused(window, cx))
-                            .inset(true)
-                            .spacing(ui::ListItemSpacing::Sparse)
-                            .start_slot(Icon::new(IconName::Exit).color(Color::Muted))
-                            .child(Label::new("Return to Host Folder"))
-                            .on_click(cx.listener({
-                                let connection_name = connection_name.clone();
-                                let connection = connection.clone();
-                                move |_, _, window, cx| {
-                                    Self::prompt_return_to_host_folder(
-                                        cx.entity(),
-                                        connection_name.clone(),
-                                        connection.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                    cx.focus_self(window);
-                                }
-                            })),
-                    )
-            })
-            .child({
-                div()
                     .id("devcontainer-options-stop")
-                    .track_focus(&entries[5].focus_handle)
+                    .track_focus(&entries[4].focus_handle)
                     .on_action(cx.listener({
                         let connection_name = connection_name.clone();
                         let connection = connection_for_stop.clone();
@@ -7114,7 +7067,7 @@ impl RemoteServerProjects {
                     }))
                     .child(
                         ListItem::new("stop-devcontainer")
-                            .toggle_state(entries[5].focus_handle.contains_focused(window, cx))
+                            .toggle_state(entries[4].focus_handle.contains_focused(window, cx))
                             .inset(true)
                             .spacing(ui::ListItemSpacing::Sparse)
                             .start_slot(Icon::new(IconName::Stop).color(Color::Warning))
@@ -7138,7 +7091,7 @@ impl RemoteServerProjects {
             .child({
                 div()
                     .id("devcontainer-options-remove")
-                    .track_focus(&entries[6].focus_handle)
+                    .track_focus(&entries[5].focus_handle)
                     .on_action(cx.listener({
                         let connection_name = connection_name.clone();
                         let connection = connection_for_remove.clone();
@@ -7156,7 +7109,7 @@ impl RemoteServerProjects {
                     }))
                     .child(
                         ListItem::new("remove-devcontainer")
-                            .toggle_state(entries[6].focus_handle.contains_focused(window, cx))
+                            .toggle_state(entries[5].focus_handle.contains_focused(window, cx))
                             .inset(true)
                             .spacing(ui::ListItemSpacing::Sparse)
                             .start_slot(Icon::new(IconName::Trash).color(Color::Error))

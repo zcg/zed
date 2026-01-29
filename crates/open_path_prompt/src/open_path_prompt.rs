@@ -796,7 +796,7 @@ impl PickerDelegate for OpenPathDelegate {
                         return;
                     };
                     picker.update(cx, |picker, cx| {
-                        picker.set_query(next_query, window, cx);
+                        picker.set_query(&next_query, window, cx);
                     });
                 });
                 return;

@@ -12,7 +12,7 @@ use gpui::AsyncWindowContext;
 use node_runtime::NodeRuntime;
 use remote::{DockerConnectionOptions, DockerHost, RemoteConnectionOptions};
 use serde::Deserialize;
-use settings::{DevContainerConnection, DevContainerHost, RegisterSetting, Settings as _};
+use settings::{DevContainerConnection, DevContainerHost, RegisterSetting, Settings};
 use smol::{fs, io::BufReader, process::Command};
 use util::shell::ShellKind;
 use workspace::Workspace;

@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use settings_macros::{MergeFrom, with_fallible_options};
-use std::{borrow::Cow, fmt::Display, str::FromStr, sync::Arc};
+use std::{borrow::Cow, fmt::Display, sync::Arc};
 
 use crate::serialize_f32_with_two_decimal_places;
 
