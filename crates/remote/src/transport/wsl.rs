@@ -180,7 +180,7 @@ impl WslRemoteConnection {
         );
 
         let dst_path =
-            paths::remote_wsl_server_dir_relative().join(RelPath::unix(&binary_name).unwrap());
+            paths::remote_server_dir_relative().join(RelPath::unix(&binary_name).unwrap());
 
         if let Some(parent) = dst_path.parent() {
             let parent = parent.display(PathStyle::Posix);
@@ -196,35 +196,27 @@ impl WslRemoteConnection {
             .is_ok();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
-        match super::build_remote_server_from_source(
+        if let Some(remote_server_path) = super::build_remote_server_from_source(
             &self.platform,
             delegate.as_ref(),
             binary_exists_on_server,
             cx,
         )
-        .await
+        .await?
         {
-            Ok(Some(remote_server_path)) => {
-                let tmp_path = paths::remote_wsl_server_dir_relative().join(
-                    &RelPath::unix(&format!(
-                        "download-{}-{}",
-                        std::process::id(),
-                        remote_server_path.file_name().unwrap().to_string_lossy()
-                    ))
-                    .unwrap(),
-                );
-                self.upload_file(&remote_server_path, &tmp_path, delegate, cx)
-                    .await?;
-                self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
-                    .await?;
-                return Ok(dst_path);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!(
-                    "Failed to build remote server from source, falling back to download: {err:#}",
-                );
-            }
+            let tmp_path = paths::remote_server_dir_relative().join(
+                &RelPath::unix(&format!(
+                    "download-{}-{}",
+                    std::process::id(),
+                    remote_server_path.file_name().unwrap().to_string_lossy()
+                ))
+                .unwrap(),
+            );
+            self.upload_file(&remote_server_path, &tmp_path, delegate, cx)
+                .await?;
+            self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
+                .await?;
+            return Ok(dst_path);
         }
 
         if binary_exists_on_server {
