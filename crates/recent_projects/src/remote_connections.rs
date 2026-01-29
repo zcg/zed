@@ -35,6 +35,8 @@ use ui::{
 };
 use util::paths::PathWithPosition;
 use workspace::{AppState, ModalView, Workspace};
+use workspace::notifications::NotificationId;
+use workspace::notifications::simple_message_notification::MessageNotification;
 
 #[derive(RegisterSetting)]
 pub struct RemoteSettings {
@@ -91,6 +93,8 @@ impl RemoteSettings {
         options
     }
 }
+
+
 
 #[derive(Clone, PartialEq)]
 pub enum Connection {
@@ -824,30 +828,40 @@ pub async fn open_remote_project(
                     })
                     .ok();
                 log::error!("Failed to open project: {e:#}");
-                let response = window
-                    .update(cx, |_, window, cx| {
-                        window.prompt(
+                let err_message = format!("{e:#}");
+                let title = match connection_options {
+                    RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
+                    RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
+                    RemoteConnectionOptions::Docker(_) => "Failed to connect to Dev Container",
+                    #[cfg(any(test, feature = "test-support"))]
+                    RemoteConnectionOptions::Mock(_) => "Failed to connect to mock server",
+                };
+                let response = window.update(cx, |workspace, window, cx| {
+                    if cfg!(target_os = "windows")
+                        && matches!(connection_options, RemoteConnectionOptions::Wsl(_))
+                    {
+                        struct WslConnectError;
+                        let notification_id = NotificationId::unique::<WslConnectError>();
+                        let message = format!("{title}.\n{err_message}");
+                        workspace.show_notification(notification_id, cx, |cx| {
+                            cx.new(|cx| MessageNotification::new(message.clone(), cx))
+                        });
+                        None
+                    } else {
+                        Some(window.prompt(
                             PromptLevel::Critical,
-                            match connection_options {
-                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                                RemoteConnectionOptions::Docker(_) => {
-                                    "Failed to connect to Dev Container"
-                                }
-                                #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
-                            },
-                            Some(&format!("{e:#}")),
+                            title,
+                            Some(&err_message),
                             &["Retry", "Cancel"],
                             cx,
-                        )
-                    })?
-                    .await;
+                        ))
+                    }
+                })?;
 
-                if response == Ok(0) {
-                    continue;
+                if let Some(response) = response {
+                    if response.await == Ok(0) {
+                        continue;
+                    }
                 }
 
                 if created_new_window {
@@ -887,29 +901,39 @@ pub async fn open_remote_project(
         match opened_items {
             Err(e) => {
                 log::error!("Failed to open project: {e:#}");
-                let response = window
-                    .update(cx, |_, window, cx| {
-                        window.prompt(
+                let err_message = format!("{e:#}");
+                let title = match connection_options {
+                    RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
+                    RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
+                    RemoteConnectionOptions::Docker(_) => "Failed to connect to Dev Container",
+                    #[cfg(any(test, feature = "test-support"))]
+                    RemoteConnectionOptions::Mock(_) => "Failed to connect to mock server",
+                };
+                let response = window.update(cx, |workspace, window, cx| {
+                    if cfg!(target_os = "windows")
+                        && matches!(connection_options, RemoteConnectionOptions::Wsl(_))
+                    {
+                        struct WslConnectError;
+                        let notification_id = NotificationId::unique::<WslConnectError>();
+                        let message = format!("{title}.\n{err_message}");
+                        workspace.show_notification(notification_id, cx, |cx| {
+                            cx.new(|cx| MessageNotification::new(message.clone(), cx))
+                        });
+                        None
+                    } else {
+                        Some(window.prompt(
                             PromptLevel::Critical,
-                            match connection_options {
-                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                                RemoteConnectionOptions::Docker(_) => {
-                                    "Failed to connect to Dev Container"
-                                }
-                                #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
-                            },
-                            Some(&format!("{e:#}")),
+                            title,
+                            Some(&err_message),
                             &["Retry", "Cancel"],
                             cx,
-                        )
-                    })?
-                    .await;
-                if response == Ok(0) {
-                    continue;
+                        ))
+                    }
+                })?;
+                if let Some(response) = response {
+                    if response.await == Ok(0) {
+                        continue;
+                    }
                 }
 
                 window

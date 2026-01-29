@@ -3830,130 +3830,83 @@ impl RemoteServerProjects {
         true
     }
 
-    fn prompt_disconnect_dev_container(
-        remote_servers: Entity<RemoteServerProjects>,
-        name: SharedString,
-        connection: DevContainerConnection,
+    fn disconnect_dev_container_now(
+        &mut self,
+        connection: &DevContainerConnection,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<RemoteServerProjects>,
     ) {
-        let prompt_message = format!("Disconnect from `{}`?", name);
-        let confirmation = window.prompt(
-            PromptLevel::Warning,
-            &prompt_message,
-            Some("The container will keep running, and the host folder will reopen."),
-            &["Disconnect", "Cancel"],
-            cx,
-        );
-
-        window
-            .spawn(cx, async move |cx| {
-            if confirmation.await.ok() == Some(0) {
-                remote_servers
-                    .update_in(cx, |this, window, cx| {
-                        this.disconnect_active_dev_container(&connection, false, cx);
-                        this.return_to_host_folder(&connection, window, cx);
-                    })
-                    .ok();
-            }
-            anyhow::Ok(())
-        })
-            .detach();
+        self.disconnect_active_dev_container(connection, false, cx);
+        self.return_to_host_folder(connection, window, cx);
     }
 
-    fn prompt_stop_dev_container(
-        remote_servers: Entity<RemoteServerProjects>,
-        name: SharedString,
+    fn stop_dev_container_now(
+        &mut self,
         connection: DevContainerConnection,
-        window: &mut Window,
-        cx: &mut App,
+        name: SharedString,
+        cx: &mut Context<RemoteServerProjects>,
     ) {
-        let prompt_message = format!("Stop container for `{}`?", name);
-        let confirmation = window.prompt(
-            PromptLevel::Warning,
-            &prompt_message,
-            Some("This will stop the container and disconnect if it is active."),
-            &["Stop and Disconnect", "Cancel"],
-            cx,
-        );
-
-        cx.spawn(async move |cx| {
-            if confirmation.await.ok() == Some(0) {
-                let result = stop_dev_container_container(&connection).await;
-                remote_servers.update(cx, |this, cx| {
-                    match result {
-                        Ok(()) => {
-                            let disconnected =
-                                this.disconnect_active_dev_container(&connection, true, cx);
-                            let message = if disconnected {
-                                format!("Stopped container and disconnected `{}`.", name)
-                            } else {
-                                format!("Stopped container `{}`.", name)
-                            };
-                            this.show_devcontainer_toast(message, cx);
-                        }
-                        Err(message) => {
-                            this.show_devcontainer_toast(
-                                format!("Failed to stop `{}`: {}", name, message),
-                                cx,
-                            );
-                        }
+        let remote_servers = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = stop_dev_container_container(&connection).await;
+            remote_servers.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        let disconnected =
+                            this.disconnect_active_dev_container(&connection, true, cx);
+                        let message = if disconnected {
+                            format!("Stopped container and disconnected `{}`.", name)
+                        } else {
+                            format!("Stopped container `{}`.", name)
+                        };
+                        this.show_devcontainer_toast(message, cx);
                     }
-                    cx.notify();
-                });
-            }
+                    Err(message) => {
+                        this.show_devcontainer_toast(
+                            format!("Failed to stop `{}`: {}", name, message),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
 
-    fn prompt_remove_dev_container(
-        remote_servers: Entity<RemoteServerProjects>,
+    fn remove_dev_container_now(
+        &mut self,
         index: DevContainerIndex,
-        name: SharedString,
         connection: DevContainerConnection,
-        window: &mut Window,
-        cx: &mut App,
+        name: SharedString,
+        cx: &mut Context<RemoteServerProjects>,
     ) {
-        let prompt_message = format!("Remove dev container `{}`?", name);
-
-        let confirmation = window.prompt(
-            PromptLevel::Warning,
-            &prompt_message,
-            Some(
-                "This will stop and delete the container, even if it is running. If Zed is connected, it will disconnect.",
-            ),
-            &["Remove and delete container", "Cancel"],
-            cx,
-        );
-
-        cx.spawn(async move |cx| {
-            if confirmation.await.ok() == Some(0) {
-                let result = remove_dev_container_container(&connection).await;
-                remote_servers.update(cx, |this, cx| {
-                    match result {
-                        Ok(()) => {
-                            let disconnected =
-                                this.disconnect_active_dev_container(&connection, true, cx);
-                            this.delete_dev_container_server(index, cx);
-                            let message = if disconnected {
-                                format!("Removed dev container `{}` and disconnected.", name)
-                            } else {
-                                format!("Removed dev container `{}`.", name)
-                            };
-                            this.show_devcontainer_toast(message, cx);
-                            this.mode = Mode::default_mode(&this.ssh_config_servers, cx);
-                        }
-                        Err(message) => {
-                            this.show_devcontainer_toast(
-                                format!("Failed to remove `{}`: {}", name, message),
-                                cx,
-                            );
-                        }
+        let remote_servers = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = remove_dev_container_container(&connection).await;
+            remote_servers.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        let disconnected = this.disconnect_active_dev_container(&connection, true, cx);
+                        this.delete_dev_container_server(index, cx);
+                        let message = if disconnected {
+                            format!("Removed dev container `{}` and disconnected.", name)
+                        } else {
+                            format!("Removed dev container `{}`.", name)
+                        };
+                        this.show_devcontainer_toast(message, cx);
+                        this.mode = Mode::default_mode(&this.ssh_config_servers, cx);
                     }
-                    cx.notify();
-                });
-            }
+                    Err(message) => {
+                        this.show_devcontainer_toast(
+                            format!("Failed to remove `{}`: {}", name, message),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -7011,16 +6964,9 @@ impl RemoteServerProjects {
                     .id("devcontainer-options-disconnect")
                     .track_focus(&entries[3].focus_handle)
                     .on_action(cx.listener({
-                        let connection_name = connection_name.clone();
                         let connection = connection_for_disconnect.clone();
-                        move |_, _: &menu::Confirm, window, cx| {
-                            Self::prompt_disconnect_dev_container(
-                                cx.entity(),
-                                connection_name.clone(),
-                                connection.clone(),
-                                window,
-                                cx,
-                            );
+                        move |this, _: &menu::Confirm, window, cx| {
+                            this.disconnect_dev_container_now(&connection, window, cx);
                             cx.focus_self(window);
                         }
                     }))
@@ -7032,16 +6978,9 @@ impl RemoteServerProjects {
                             .start_slot(Icon::new(IconName::Disconnected).color(Color::Muted))
                             .child(Label::new("Disconnect and Return to Host"))
                             .on_click(cx.listener({
-                                let connection_name = connection_name.clone();
                                 let connection = connection_for_disconnect.clone();
-                                move |_, _, window, cx| {
-                                    Self::prompt_disconnect_dev_container(
-                                        cx.entity(),
-                                        connection_name.clone(),
-                                        connection.clone(),
-                                        window,
-                                        cx,
-                                    );
+                                move |this, _, window, cx| {
+                                    this.disconnect_dev_container_now(&connection, window, cx);
                                     cx.focus_self(window);
                                 }
                             })),
@@ -7054,15 +6993,9 @@ impl RemoteServerProjects {
                     .on_action(cx.listener({
                         let connection_name = connection_name.clone();
                         let connection = connection_for_stop.clone();
-                        move |_, _: &menu::Confirm, window, cx| {
-                            Self::prompt_stop_dev_container(
-                                cx.entity(),
-                                connection_name.clone(),
-                                connection.clone(),
-                                window,
-                                cx,
-                            );
-                            cx.focus_self(window);
+                        move |this, _: &menu::Confirm, _window, cx| {
+                            this.stop_dev_container_now(connection.clone(), connection_name.clone(), cx);
+                            cx.focus_self(_window);
                         }
                     }))
                     .child(
@@ -7075,14 +7008,8 @@ impl RemoteServerProjects {
                             .on_click(cx.listener({
                                 let connection_name = connection_name.clone();
                                 let connection = connection_for_stop.clone();
-                                move |_, _, window, cx| {
-                                    Self::prompt_stop_dev_container(
-                                        cx.entity(),
-                                        connection_name.clone(),
-                                        connection.clone(),
-                                        window,
-                                        cx,
-                                    );
+                                move |this, _, window, cx| {
+                                    this.stop_dev_container_now(connection.clone(), connection_name.clone(), cx);
                                     cx.focus_self(window);
                                 }
                             })),
@@ -7095,13 +7022,11 @@ impl RemoteServerProjects {
                     .on_action(cx.listener({
                         let connection_name = connection_name.clone();
                         let connection = connection_for_remove.clone();
-                        move |_, _: &menu::Confirm, window, cx| {
-                            Self::prompt_remove_dev_container(
-                                cx.entity(),
+                        move |this, _: &menu::Confirm, window, cx| {
+                            this.remove_dev_container_now(
                                 index,
-                                connection_name.clone(),
                                 connection.clone(),
-                                window,
+                                connection_name.clone(),
                                 cx,
                             );
                             cx.focus_self(window);
@@ -7117,13 +7042,11 @@ impl RemoteServerProjects {
                             .on_click(cx.listener({
                                 let connection_name = connection_name.clone();
                                 let connection = connection_for_remove.clone();
-                                move |_, _, window, cx| {
-                                    Self::prompt_remove_dev_container(
-                                        cx.entity(),
+                                move |this, _, window, cx| {
+                                    this.remove_dev_container_now(
                                         index,
-                                        connection_name.clone(),
                                         connection.clone(),
-                                        window,
+                                        connection_name.clone(),
                                         cx,
                                     );
                                     cx.focus_self(window);

@@ -759,7 +759,7 @@ impl RemoteConnection for DockerExecConnection {
         };
 
         let mut docker_args = vec!["exec".to_string()];
-        for env_var in ["RUST_LOG", "RUST_BACKTRACE", "ZED_GENERATE_MINIDUMPS"] {
+        for env_var in ["RUST_LOG", "RUST_BACKTRACE", "ZED_GENERATE_MINIDUMPS", "GITHUB_TOKEN"] {
             if let Some(value) = std::env::var(env_var).ok() {
                 docker_args.push("-e".to_string());
                 docker_args.push(format!("{}='{}'", env_var, value));
