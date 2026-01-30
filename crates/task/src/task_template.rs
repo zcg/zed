@@ -205,12 +205,14 @@ impl TaskTemplate {
             &variable_names,
             &mut substituted_variables,
         )?;
-        let args_with_substitutions = substitute_all_template_variables_in_vec(
+        let mut args_with_substitutions = substitute_all_template_variables_in_vec(
             &self.args,
             &task_variables,
             &variable_names,
             &mut substituted_variables,
         )?;
+        // Drop empty args produced by variable substitution (e.g. optional flags).
+        args_with_substitutions.retain(|arg| !arg.is_empty());
 
         let task_hash = to_hex_hash(self)
             .context("hashing task template")
