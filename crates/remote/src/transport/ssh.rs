@@ -32,7 +32,7 @@ use tempfile::TempDir;
 use util::{
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
-    shell::{PosixShell, ShellKind},
+    shell::ShellKind,
 };
 
 pub(crate) struct SshRemoteConnection {
@@ -591,7 +591,7 @@ impl SshRemoteConnection {
         let ssh_shell = socket.shell(is_windows).await;
         log::info!("Remote shell discovered: {}", ssh_shell);
 
-        let ssh_shell_kind = ShellKind::new_with_fallback(&ssh_shell, is_windows);
+        let ssh_shell_kind = ShellKind::new(&ssh_shell, is_windows);
         let ssh_platform = socket.platform(ssh_shell_kind, is_windows).await?;
         log::info!("Remote platform discovered: {:?}", ssh_platform);
 
@@ -927,7 +927,7 @@ impl SshRemoteConnection {
         dst_path: &RelPath,
         tmp_path: &RelPath,
     ) -> Result<()> {
-        let shell_kind = self.ssh_shell_kind;
+        let shell_kind = ShellKind::Posix;
         let server_mode = 0o755;
         let orig_tmp_path = tmp_path.display(self.path_style());
         let server_mode = format!("{:o}", server_mode);
@@ -1147,6 +1147,7 @@ impl SshSocket {
             .expect("shell quoting")
             .into_owned();
         for arg in args {
+            // We're trying to work with: sh, bash, zsh, fish, tcsh, ...?
             debug_assert!(
                 !arg.as_ref().contains('\n'),
                 "multiline arguments do not work in all shells"
@@ -1299,14 +1300,8 @@ impl SshSocket {
 
     async fn shell_posix(&self) -> String {
         const DEFAULT_SHELL: &str = "sh";
-        // TODO: Consider using the user's actual shell instead of hardcoding "sh"
         match self
-            .run_command(
-                ShellKind::Posix(PosixShell::Sh),
-                "sh",
-                &["-c", "echo $SHELL"],
-                false,
-            )
+            .run_command(ShellKind::Posix, "sh", &["-c", "echo $SHELL"], false)
             .await
         {
             Ok(output) => parse_shell(&output, DEFAULT_SHELL),
@@ -1406,8 +1401,7 @@ impl SshConnectionOptions {
             "-w",
         ];
 
-        // TODO: Consider using the user's actual shell instead of hardcoding "sh"
-        let mut tokens = ShellKind::Posix(PosixShell::Sh)
+        let mut tokens = ShellKind::Posix
             .split(input)
             .context("invalid input")?
             .into_iter();
@@ -1645,7 +1639,7 @@ fn build_command_posix(
                 .context("shell quoting")?
         )?;
         for arg in input_args {
-            let arg = ssh_shell_kind.try_quote(arg).context("shell quoting")?;
+            let arg = ssh_shell_kind.try_quote(&arg).context("shell quoting")?;
             write!(exec, " {}", &arg)?;
         }
     } else {
@@ -1687,7 +1681,7 @@ fn build_command_windows(
     ssh_env: HashMap<String, String>,
     ssh_path_style: PathStyle,
     ssh_shell: &str,
-    ssh_shell_kind: ShellKind,
+    _ssh_shell_kind: ShellKind,
     ssh_args: Vec<String>,
     interactive: Interactive,
 ) -> Result<CommandTemplate> {
@@ -1706,7 +1700,7 @@ fn build_command_windows(
             shell_kind
                 .try_quote(&working_dir)
                 .context("shell quoting")?,
-            ssh_shell_kind.sequential_and_commands_separator()
+            shell_kind.sequential_and_commands_separator()
         )?;
     }
 
@@ -1793,7 +1787,7 @@ mod tests {
             env.clone(),
             PathStyle::Posix,
             "/bin/bash",
-            ShellKind::Posix(PosixShell::Bash),
+            ShellKind::Posix,
             vec!["-o".to_string(), "ControlMaster=auto".to_string()],
             Interactive::No,
         )?;
