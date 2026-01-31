@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 use util::ResultExt;
-use util::shell::{PosixShell, ShellKind};
+use util::shell::ShellKind;
 use util::{
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
@@ -464,7 +464,7 @@ echo "/tmp"
         let server_mode = 0o755;
 
         // TODO: Consider using the remote's actual shell instead of hardcoding "sh"
-        let shell_kind = ShellKind::Posix(PosixShell::Sh);
+        let shell_kind = ShellKind::Posix;
         let orig_tmp_path = tmp_path.display(self.path_style());
         let server_mode = format!("{:o}", server_mode);
         let server_mode = shell_kind
