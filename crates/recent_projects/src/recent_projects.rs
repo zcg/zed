@@ -13,7 +13,8 @@ use dev_container::start_dev_container;
 use remote::RemoteConnectionOptions;
 use remote::WslConnectionOptions;
 use remote_connections::upsert_dev_container_connection;
-pub use remote_connections::{RemoteConnectionModal, connect, open_remote_project};
+pub use remote_connection::{RemoteConnectionModal, connect};
+pub use remote_connections::open_remote_project;
 
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy::{StringMatch, StringMatchCandidate};

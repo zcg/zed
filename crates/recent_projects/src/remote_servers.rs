@@ -2728,6 +2728,7 @@ impl RemoteServerProjects {
                 ViewServerOptionsState::DevContainer {
                     connection: DevContainerConnection {
                         name: connection.name,
+                        remote_user: connection.remote_user,
                         container_id: connection.container_id,
                         use_podman: connection.use_podman,
                         projects,

@@ -988,6 +988,8 @@ pub struct RemoteSettingsContent {
 )]
 pub struct DevContainerConnection {
     pub name: String,
+    #[serde(default = "default_devcontainer_remote_user")]
+    pub remote_user: String,
     pub container_id: String,
     pub use_podman: bool,
     #[serde(default)]
@@ -995,6 +997,10 @@ pub struct DevContainerConnection {
     #[serde(default)]
     pub host_projects: BTreeSet<RemoteProject>,
     pub host: Option<DevContainerHost>,
+}
+
+fn default_devcontainer_remote_user() -> String {
+    "root".to_string()
 }
 
 #[with_fallible_options]
@@ -1086,6 +1092,16 @@ pub struct ReplSettingsContent {
     ///
     /// Default: 50
     pub inline_output_max_length: Option<usize>,
+    /// Maximum number of lines of output to display before scrolling.
+    /// Set to 0 to disable output height limits.
+    ///
+    /// Default: 0
+    pub output_max_height_lines: Option<usize>,
+    /// Maximum number of columns of output to display before scaling images.
+    /// Set to 0 to disable output width limits.
+    ///
+    /// Default: 0
+    pub output_max_width_columns: Option<usize>,
 }
 
 /// Settings for configuring the which-key popup behaviour.

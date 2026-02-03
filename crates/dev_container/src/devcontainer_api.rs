@@ -24,7 +24,7 @@ use crate::{DevContainerFeature, DevContainerSettings, DevContainerTemplate};
 struct DevContainerUp {
     _outcome: String,
     container_id: String,
-    _remote_user: String,
+    remote_user: String,
     remote_workspace_folder: String,
 }
 
@@ -304,6 +304,7 @@ pub async fn start_dev_container_with_progress(
         let DevContainerUp {
             container_id,
             remote_workspace_folder,
+            remote_user,
             ..
         } = match devcontainer_up_remote(
             &remote_options,
@@ -357,6 +358,7 @@ pub async fn start_dev_container_with_progress(
 
         let connection = DevContainerConnection {
             name: project_name,
+            remote_user,
             container_id,
             use_podman,
             projects: BTreeSet::new(),
@@ -418,6 +420,7 @@ pub async fn start_dev_container_with_progress(
         let DevContainerUp {
             container_id,
             remote_workspace_folder,
+            remote_user,
             ..
         } = match devcontainer_up(
             &path_to_devcontainer_cli,
@@ -475,6 +478,7 @@ pub async fn start_dev_container_with_progress(
 
         let connection = DevContainerConnection {
             name: project_name,
+            remote_user,
             container_id,
             use_podman,
             projects: BTreeSet::new(),
@@ -1713,7 +1717,7 @@ mod tests {
             up.container_id,
             "826abcac45afd412abff083ab30793daff2f3c8ce2c831df728baf39933cb37a"
         );
-        assert_eq!(up._remote_user, "vscode");
+        assert_eq!(up.remote_user, "vscode");
         assert_eq!(up.remote_workspace_folder, "/workspaces/zed");
 
         let json_in_plaintext = r#"[2026-01-22T16:19:08.802Z] @devcontainers/cli 0.80.1. Node.js v22.21.1. darwin 24.6.0 arm64.
@@ -1724,7 +1728,7 @@ mod tests {
             up.container_id,
             "826abcac45afd412abff083ab30793daff2f3c8ce2c831df728baf39933cb37a"
         );
-        assert_eq!(up._remote_user, "vscode");
+        assert_eq!(up.remote_user, "vscode");
         assert_eq!(up.remote_workspace_folder, "/workspaces/zed");
     }
 }
